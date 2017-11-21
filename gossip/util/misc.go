@@ -1,34 +1,38 @@
 /*
-Copyright IBM Corp. 2016 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-		 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package util
 
 import (
+	cryptorand "crypto/rand"
 	"fmt"
+	"io"
+	"math/big"
 	"math/rand"
 	"reflect"
 	"runtime"
 	"sync"
+	"time"
+
+	"github.com/spf13/viper"
 )
 
 // Equals returns whether a and b are the same
 type Equals func(a interface{}, b interface{}) bool
 
-func init() {
-	rand.Seed(42)
+var viperLock sync.RWMutex
+
+// Contains returns whether a given slice a contains a string s
+func Contains(s string, a []string) bool {
+	for _, e := range a {
+		if e == s {
+			return true
+		}
+	}
+	return false
 }
 
 // IndexInSlice returns the index of given object o in array
@@ -62,21 +66,13 @@ func GetRandomIndices(indiceCount, highestIndex int) []int {
 	}
 
 	for len(indices) < indiceCount {
-		n := rand.Intn(highestIndex + 1)
+		n := RandomInt(highestIndex + 1)
 		if IndexInSlice(indices, n, numbericEqual) != -1 {
 			continue
 		}
 		indices = append(indices, n)
 	}
 	return indices
-}
-
-// Abs returns abs(a-b)
-func Abs(a, b uint64) uint64 {
-	if a > b {
-		return a - b
-	}
-	return b - a
 }
 
 // Set is a generic and thread-safe
@@ -104,6 +100,13 @@ func (s *Set) Exists(item interface{}) bool {
 	defer s.lock.RUnlock()
 	_, exists := s.items[item]
 	return exists
+}
+
+// Size returns the size of the set
+func (s *Set) Size() int {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	return len(s.items)
 }
 
 // ToArray returns a slice with items
@@ -134,15 +137,66 @@ func (s *Set) Remove(item interface{}) {
 	delete(s.items, item)
 }
 
-type goroutine struct {
-	id    int64
-	Stack []string
-}
-
 // PrintStackTrace prints to stdout
 // all goroutines
 func PrintStackTrace() {
 	buf := make([]byte, 1<<16)
 	runtime.Stack(buf, true)
 	fmt.Printf("%s", buf)
+}
+
+// GetIntOrDefault returns the int value from config if present otherwise default value
+func GetIntOrDefault(key string, defVal int) int {
+	viperLock.RLock()
+	defer viperLock.RUnlock()
+
+	if val := viper.GetInt(key); val != 0 {
+		return val
+	}
+
+	return defVal
+}
+
+// GetDurationOrDefault returns the Duration value from config if present otherwise default value
+func GetDurationOrDefault(key string, defVal time.Duration) time.Duration {
+	viperLock.RLock()
+	defer viperLock.RUnlock()
+
+	if val := viper.GetDuration(key); val != 0 {
+		return val
+	}
+
+	return defVal
+}
+
+// SetDuration stores duration key value to viper
+func SetDuration(key string, val time.Duration) {
+	viperLock.Lock()
+	defer viperLock.Unlock()
+	viper.Set(key, val)
+}
+
+// RandomInt returns, as an int, a non-negative pseudo-random integer in [0,n)
+// It panics if n <= 0
+func RandomInt(n int) int {
+	if n <= 0 {
+		panic(fmt.Sprintf("Got invalid (non positive) value: %d", n))
+	}
+	m := int(RandomUInt64()) % n
+	if m < 0 {
+		return n + m
+	}
+	return m
+}
+
+// RandomUInt64 returns a random uint64
+func RandomUInt64() uint64 {
+	b := make([]byte, 8)
+	_, err := io.ReadFull(cryptorand.Reader, b)
+	if err == nil {
+		n := new(big.Int)
+		return n.SetBytes(b).Uint64()
+	}
+	rand.Seed(rand.Int63())
+	return uint64(rand.Int63())
 }

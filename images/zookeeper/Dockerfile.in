@@ -1,5 +1,9 @@
-FROM hyperledger/fabric-baseimage:_BASE_TAG_
-# Based on https://github.com/31z4/zookeeper-docker/blob/master/3.4.9/Dockerfile
+# Copyright Greg Haskins All Rights Reserved
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+FROM _BASE_NS_/fabric-baseimage:_BASE_TAG_
+# Based on https://github.com/31z4/zookeeper-docker/blob/master/3.4.10/Dockerfile
 
 # Install su-exec
 RUN set -x \
@@ -24,15 +28,13 @@ RUN set -x \
     && chown "$ZOO_USER:$ZOO_USER" "$ZOO_DATA_LOG_DIR" "$ZOO_DATA_DIR" "$ZOO_CONF_DIR"
 
 ARG GPG_KEY=C823E3E5B12AF29C67F81976F5CECB3CB5E9BD2D
-ARG DISTRO_NAME=zookeeper-3.4.9
+ARG DISTRO_NAME=zookeeper-3.4.10
 
 # Download Apache Zookeeper, verify its PGP signature, untar and clean up
 RUN set -x \
     && cd / \
-    && wget -q "http://www.apache.org/dist/zookeeper/$DISTRO_NAME/$DISTRO_NAME.tar.gz" \
-    && tar -xzf "$DISTRO_NAME.tar.gz" \
-    && mv "$DISTRO_NAME/conf/"* "$ZOO_CONF_DIR" \
-    && rm -r "$DISTRO_NAME.tar.gz"
+    && curl -fsSL "http://www.apache.org/dist/zookeeper/$DISTRO_NAME/$DISTRO_NAME.tar.gz" | tar -xz \
+    && mv "$DISTRO_NAME/conf/"* "$ZOO_CONF_DIR"
 
 WORKDIR $DISTRO_NAME
 VOLUME ["$ZOO_DATA_DIR", "$ZOO_DATA_LOG_DIR"]

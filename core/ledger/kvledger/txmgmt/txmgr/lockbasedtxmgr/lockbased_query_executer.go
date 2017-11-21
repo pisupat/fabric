@@ -17,21 +17,19 @@ limitations under the License.
 package lockbasedtxmgr
 
 import (
-	"github.com/hyperledger/fabric/common/util"
-	"github.com/hyperledger/fabric/core/ledger"
+	"github.com/hyperledger/fabric/common/ledger"
 )
 
 // LockBasedQueryExecutor is a query executor used in `LockBasedTxMgr`
 type lockBasedQueryExecutor struct {
 	helper *queryHelper
-	id     string
+	txid   string
 }
 
-func newQueryExecutor(txmgr *LockBasedTxMgr) *lockBasedQueryExecutor {
-	helper := &queryHelper{txmgr: txmgr, rwset: nil}
-	id := util.GenerateUUID()
-	logger.Debugf("constructing new query executor [%s]", id)
-	return &lockBasedQueryExecutor{helper, id}
+func newQueryExecutor(txmgr *LockBasedTxMgr, txid string) *lockBasedQueryExecutor {
+	helper := &queryHelper{txmgr: txmgr, rwsetBuilder: nil}
+	logger.Debugf("constructing new query executor txid = [%s]", txid)
+	return &lockBasedQueryExecutor{helper, txid}
 }
 
 // GetState implements method in interface `ledger.QueryExecutor`
@@ -53,12 +51,32 @@ func (q *lockBasedQueryExecutor) GetStateRangeScanIterator(namespace string, sta
 }
 
 // ExecuteQuery implements method in interface `ledger.QueryExecutor`
-func (q *lockBasedQueryExecutor) ExecuteQuery(query string) (ledger.ResultsIterator, error) {
-	return q.helper.executeQuery(query)
+func (q *lockBasedQueryExecutor) ExecuteQuery(namespace, query string) (ledger.ResultsIterator, error) {
+	return q.helper.executeQuery(namespace, query)
+}
+
+// GetPrivateData implements method in interface `ledger.QueryExecutor`
+func (q *lockBasedQueryExecutor) GetPrivateData(namespace, collection, key string) ([]byte, error) {
+	return q.helper.getPrivateData(namespace, collection, key)
+}
+
+// GetPrivateDataMultipleKeys implements method in interface `ledger.QueryExecutor`
+func (q *lockBasedQueryExecutor) GetPrivateDataMultipleKeys(namespace, collection string, keys []string) ([][]byte, error) {
+	return q.helper.getPrivateDataMultipleKeys(namespace, collection, keys)
+}
+
+// GetPrivateDataRangeScanIterator implements method in interface `ledger.QueryExecutor`
+func (q *lockBasedQueryExecutor) GetPrivateDataRangeScanIterator(namespace, collection, startKey, endKey string) (ledger.ResultsIterator, error) {
+	return q.helper.getPrivateDataRangeScanIterator(namespace, collection, startKey, endKey)
+}
+
+// ExecuteQueryOnPrivateData implements method in interface `ledger.QueryExecutor`
+func (q *lockBasedQueryExecutor) ExecuteQueryOnPrivateData(namespace, collection, query string) (ledger.ResultsIterator, error) {
+	return q.helper.executeQueryOnPrivateData(namespace, collection, query)
 }
 
 // Done implements method in interface `ledger.QueryExecutor`
 func (q *lockBasedQueryExecutor) Done() {
-	logger.Debugf("Done query executer/ tx simulator [%s]", q.id)
+	logger.Debugf("Done with transaction simulation / query execution [%s]", q.txid)
 	q.helper.done()
 }

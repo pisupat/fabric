@@ -1,78 +1,66 @@
 /*
-Copyright IBM Corp. 2017 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-                 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package test
 
 import (
-	"io/ioutil"
-	"os"
-
-	"github.com/hyperledger/fabric/common/configtx"
+	"github.com/hyperledger/fabric/common/channelconfig"
+	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/common/genesis"
+	"github.com/hyperledger/fabric/common/tools/configtxgen/encoder"
+	genesisconfig "github.com/hyperledger/fabric/common/tools/configtxgen/localconfig"
 	cb "github.com/hyperledger/fabric/protos/common"
+	mspproto "github.com/hyperledger/fabric/protos/msp"
+	pb "github.com/hyperledger/fabric/protos/peer"
 	"github.com/hyperledger/fabric/protos/utils"
-
-	"github.com/golang/protobuf/proto"
-	"github.com/hyperledger/fabric/protos/peer"
 )
 
-const (
-	// AcceptAllPolicyKey is the key of the AcceptAllPolicy.
-	AcceptAllPolicyKey = "AcceptAllPolicy"
-)
+var logger = flogging.MustGetLogger("common/configtx/test")
 
-var template configtx.Template
-
-var genesisFactory genesis.Factory
-
-// XXX This is a hacky singleton, which should go away, but is an artifact of using the existing utils implementation
-type MSPTemplate struct{}
-
-func (msp MSPTemplate) Items(chainID string) ([]*cb.SignedConfigurationItem, error) {
-	return []*cb.SignedConfigurationItem{utils.EncodeMSP(chainID)}, nil
-}
-
-func init() {
-
-	gopath := os.Getenv("GOPATH")
-	data, err := ioutil.ReadFile(gopath + "/src/github.com/hyperledger/fabric/common/configtx/test/orderer.template")
-	if err != nil {
-		peerConfig := os.Getenv("PEER_CFG_PATH")
-		data, err = ioutil.ReadFile(peerConfig + "/common/configtx/test/orderer.template")
-		if err != nil {
-			panic(err)
-		}
-	}
-	templateProto := &cb.ConfigurationTemplate{}
-	err = proto.Unmarshal(data, templateProto)
-	if err != nil {
-		panic(err)
-	}
-
-	template = configtx.NewSimpleTemplate(templateProto.Items...)
-	anchorPeers := []*peer.AnchorPeer{{Host: "fakehost", Port: 2000, Cert: []byte{}}}
-	gossTemplate := configtx.NewSimpleTemplate(utils.EncodeAnchorPeers(anchorPeers))
-	genesisFactory = genesis.NewFactoryImpl(configtx.NewCompositeTemplate(MSPTemplate{}, template, gossTemplate))
-}
-
+// MakeGenesisBlock creates a genesis block using the test templates for the given chainID
 func MakeGenesisBlock(chainID string) (*cb.Block, error) {
-	return genesisFactory.Block(chainID)
+	profile := genesisconfig.Load(genesisconfig.SampleDevModeSoloProfile)
+	channelGroup, err := encoder.NewChannelGroup(profile)
+	if err != nil {
+		logger.Panicf("Error creating channel config: %s", err)
+	}
+
+	return genesis.NewFactoryImpl(channelGroup).Block(chainID)
 }
 
-// GetOrderererTemplate returns the test orderer template
-func GetOrdererTemplate() configtx.Template {
-	return template
+// MakeGenesisBlockWithMSPs creates a genesis block using the MSPs provided for the given chainID
+func MakeGenesisBlockFromMSPs(chainID string, appMSPConf, ordererMSPConf *mspproto.MSPConfig,
+	appOrgID, ordererOrgID string) (*cb.Block, error) {
+	profile := genesisconfig.Load(genesisconfig.SampleDevModeSoloProfile)
+	profile.Orderer.Organizations = nil
+	channelGroup, err := encoder.NewChannelGroup(profile)
+	if err != nil {
+		logger.Panicf("Error creating channel config: %s", err)
+	}
+
+	ordererOrg := cb.NewConfigGroup()
+	ordererOrg.ModPolicy = channelconfig.AdminsPolicyKey
+	ordererOrg.Values[channelconfig.MSPKey] = &cb.ConfigValue{
+		Value:     utils.MarshalOrPanic(channelconfig.MSPValue(ordererMSPConf).Value()),
+		ModPolicy: channelconfig.AdminsPolicyKey,
+	}
+
+	applicationOrg := cb.NewConfigGroup()
+	applicationOrg.ModPolicy = channelconfig.AdminsPolicyKey
+	applicationOrg.Values[channelconfig.MSPKey] = &cb.ConfigValue{
+		Value:     utils.MarshalOrPanic(channelconfig.MSPValue(appMSPConf).Value()),
+		ModPolicy: channelconfig.AdminsPolicyKey,
+	}
+	applicationOrg.Values[channelconfig.AnchorPeersKey] = &cb.ConfigValue{
+		Value:     utils.MarshalOrPanic(channelconfig.AnchorPeersValue([]*pb.AnchorPeer{}).Value()),
+		ModPolicy: channelconfig.AdminsPolicyKey,
+	}
+
+	channelGroup.Groups[channelconfig.OrdererGroupKey].Groups[ordererOrgID] = ordererOrg
+	channelGroup.Groups[channelconfig.ApplicationGroupKey].Groups[ordererOrgID] = applicationOrg
+
+	return genesis.NewFactoryImpl(channelGroup).Block(chainID)
 }

@@ -21,55 +21,59 @@ import (
 	"io"
 	"time"
 
+	"github.com/hyperledger/fabric/common/flogging"
 	pb "github.com/hyperledger/fabric/protos/peer"
-	"github.com/op/go-logging"
 )
 
-const defaultTimeout = time.Second * 3
-
-var producerLogger = logging.MustGetLogger("eventhub_producer")
+var logger = flogging.MustGetLogger("eventhub_producer")
 
 // EventsServer implementation of the Peer service
 type EventsServer struct {
+}
+
+// EventsServerConfig contains the setup config for the events server
+type EventsServerConfig struct {
+	BufferSize uint
+	Timeout    time.Duration
+	TimeWindow time.Duration
 }
 
 //singleton - if we want to create multiple servers, we need to subsume events.gEventConsumers into EventsServer
 var globalEventsServer *EventsServer
 
 // NewEventsServer returns a EventsServer
-func NewEventsServer(bufferSize uint, timeout int) *EventsServer {
+func NewEventsServer(config *EventsServerConfig) *EventsServer {
 	if globalEventsServer != nil {
 		panic("Cannot create multiple event hub servers")
 	}
 	globalEventsServer = new(EventsServer)
-	initializeEvents(bufferSize, timeout)
+	initializeEvents(config)
 	//initializeCCEventProcessor(bufferSize, timeout)
 	return globalEventsServer
 }
 
-// Chat implementation of the the Chat bidi streaming RPC function
+// Chat implementation of the Chat bidi streaming RPC function
 func (p *EventsServer) Chat(stream pb.Events_ChatServer) error {
 	handler, err := newEventHandler(stream)
 	if err != nil {
-		return fmt.Errorf("Error creating handler during handleChat initiation: %s", err)
+		return fmt.Errorf("error creating handler during handleChat initiation: %s", err)
 	}
 	defer handler.Stop()
 	for {
 		in, err := stream.Recv()
 		if err == io.EOF {
-			producerLogger.Debug("Received EOF, ending Chat")
+			logger.Debug("Received EOF, ending Chat")
 			return nil
 		}
 		if err != nil {
-			e := fmt.Errorf("Error during Chat, stopping handler: %s", err)
-			producerLogger.Error(e.Error())
+			e := fmt.Errorf("error during Chat, stopping handler: %s", err)
+			logger.Error(e.Error())
 			return e
 		}
 		err = handler.HandleMessage(in)
 		if err != nil {
-			producerLogger.Errorf("Error handling message: %s", err)
+			logger.Errorf("Error handling message: %s", err)
 			return err
 		}
-
 	}
 }

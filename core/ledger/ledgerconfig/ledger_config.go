@@ -19,27 +19,13 @@ package ledgerconfig
 import (
 	"path/filepath"
 
+	"github.com/hyperledger/fabric/core/config"
 	"github.com/spf13/viper"
 )
 
-var stateDatabase = "goleveldb"
-var couchDBAddress = "127.0.0.1:5984"
-var username = ""
-var password = ""
-var historyDatabase = true
-
-var maxBlockFileSize = 0
-
-// CouchDBDef contains parameters
-type CouchDBDef struct {
-	URL      string
-	Username string
-	Password string
-}
-
 //IsCouchDBEnabled exposes the useCouchDB variable
 func IsCouchDBEnabled() bool {
-	stateDatabase = viper.GetString("ledger.state.stateDatabase")
+	stateDatabase := viper.GetString("ledger.state.stateDatabase")
 	if stateDatabase == "CouchDB" {
 		return true
 	}
@@ -49,11 +35,11 @@ func IsCouchDBEnabled() bool {
 // GetRootPath returns the filesystem path.
 // All ledger related contents are expected to be stored under this path
 func GetRootPath() string {
-	sysPath := viper.GetString("peer.fileSystemPath")
+	sysPath := config.GetPath("peer.fileSystemPath")
 	return filepath.Join(sysPath, "ledgersData")
 }
 
-// GetLedgerProviderPath returns the filesystem path for stroing ledger ledgerProvider contents
+// GetLedgerProviderPath returns the filesystem path for storing ledger ledgerProvider contents
 func GetLedgerProviderPath() string {
 	return filepath.Join(GetRootPath(), "ledgerProvider")
 }
@@ -68,9 +54,19 @@ func GetHistoryLevelDBPath() string {
 	return filepath.Join(GetRootPath(), "historyLeveldb")
 }
 
-// GetBlockStorePath returns the filesystem path that is used by the block store
+// GetPvtWritesetStorePath returns the filesystem path that is used for permanent storage of privare write-sets
+func GetPvtWritesetStorePath() string {
+	return filepath.Join(GetRootPath(), "pvtWritesetStore")
+}
+
+// GetBlockStorePath returns the filesystem path that is used for the chain block stores
 func GetBlockStorePath() string {
-	return filepath.Join(GetRootPath(), "blocks")
+	return filepath.Join(GetRootPath(), "chains")
+}
+
+// GetPvtdataStorePath returns the filesystem path that is used for permanent storage of private write-sets
+func GetPvtdataStorePath() string {
+	return filepath.Join(GetRootPath(), "pvtdataStore")
 }
 
 // GetMaxBlockfileSize returns maximum size of the block file
@@ -78,17 +74,40 @@ func GetMaxBlockfileSize() int {
 	return 64 * 1024 * 1024
 }
 
-//GetCouchDBDefinition exposes the useCouchDB variable
-func GetCouchDBDefinition() *CouchDBDef {
+//GetQueryLimit exposes the queryLimit variable
+func GetQueryLimit() int {
+	queryLimit := viper.GetInt("ledger.state.couchDBConfig.queryLimit")
+	// if queryLimit was unset, default to 10000
+	if !viper.IsSet("ledger.state.couchDBConfig.queryLimit") {
+		queryLimit = 10000
+	}
+	return queryLimit
+}
 
-	couchDBAddress = viper.GetString("ledger.state.couchDBConfig.couchDBAddress")
-	username = viper.GetString("ledger.state.couchDBConfig.username")
-	password = viper.GetString("ledger.state.couchDBConfig.password")
-
-	return &CouchDBDef{couchDBAddress, username, password}
+//GetMaxBatchUpdateSize exposes the maxBatchUpdateSize variable
+func GetMaxBatchUpdateSize() int {
+	maxBatchUpdateSize := viper.GetInt("ledger.state.couchDBConfig.maxBatchUpdateSize")
+	// if maxBatchUpdateSize was unset, default to 500
+	if !viper.IsSet("ledger.state.couchDBConfig.maxBatchUpdateSize") {
+		maxBatchUpdateSize = 500
+	}
+	return maxBatchUpdateSize
 }
 
 //IsHistoryDBEnabled exposes the historyDatabase variable
 func IsHistoryDBEnabled() bool {
-	return viper.GetBool("ledger.state.historyDatabase")
+	return viper.GetBool("ledger.history.enableHistoryDatabase")
+}
+
+// IsQueryReadsHashingEnabled enables or disables computing of hash
+// of range query results for phantom item validation
+func IsQueryReadsHashingEnabled() bool {
+	return true
+}
+
+// GetMaxDegreeQueryReadsHashing return the maximum degree of the merkle tree for hashes of
+// of range query results for phantom item validation
+// For more details - see description in kvledger/txmgmt/rwset/query_results_helper.go
+func GetMaxDegreeQueryReadsHashing() uint32 {
+	return 50
 }

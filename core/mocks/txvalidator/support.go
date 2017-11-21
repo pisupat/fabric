@@ -17,6 +17,9 @@ limitations under the License.
 package support
 
 import (
+	"github.com/hyperledger/fabric/common/channelconfig"
+	mockpolicies "github.com/hyperledger/fabric/common/mocks/policies"
+	"github.com/hyperledger/fabric/common/policies"
 	"github.com/hyperledger/fabric/core/ledger"
 	"github.com/hyperledger/fabric/msp"
 	"github.com/hyperledger/fabric/protos/common"
@@ -26,6 +29,11 @@ type Support struct {
 	LedgerVal     ledger.PeerLedger
 	MSPManagerVal msp.MSPManager
 	ApplyVal      error
+	ACVal         channelconfig.ApplicationCapabilities
+}
+
+func (ms *Support) Capabilities() channelconfig.ApplicationCapabilities {
+	return ms.ACVal
 }
 
 // Ledger returns LedgerVal
@@ -39,6 +47,14 @@ func (ms *Support) MSPManager() msp.MSPManager {
 }
 
 // Apply returns ApplyVal
-func (ms *Support) Apply(configtx *common.ConfigurationEnvelope) error {
+func (ms *Support) Apply(configtx *common.ConfigEnvelope) error {
 	return ms.ApplyVal
+}
+
+func (ms *Support) PolicyManager() policies.Manager {
+	return &mockpolicies.Manager{}
+}
+
+func (cs *Support) GetMSPIDs(cid string) []string {
+	return []string{"DEFAULT"}
 }

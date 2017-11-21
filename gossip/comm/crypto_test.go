@@ -1,17 +1,7 @@
 /*
-Copyright IBM Corp. 2016 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-		 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package comm
@@ -20,12 +10,12 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
-	"os"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/hyperledger/fabric/gossip/proto"
+	"github.com/hyperledger/fabric/gossip/util"
+	proto "github.com/hyperledger/fabric/protos/gossip"
 	"github.com/stretchr/testify/assert"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
@@ -38,6 +28,10 @@ type gossipTestServer struct {
 	selfCertHash   []byte
 	ll             net.Listener
 	s              *grpc.Server
+}
+
+func init() {
+	util.SetupTestLogging()
 }
 
 func createTestServer(t *testing.T, cert *tls.Certificate) *gossipTestServer {
@@ -79,28 +73,19 @@ func (s *gossipTestServer) Ping(context.Context, *proto.Empty) (*proto.Empty, er
 }
 
 func TestCertificateExtraction(t *testing.T) {
-	err := generateCertificates("key.pem", "cert.pem")
-	defer os.Remove("cert.pem")
-	defer os.Remove("key.pem")
-	assert.NoError(t, err, "%v", err)
-	serverCert, err := tls.LoadX509KeyPair("cert.pem", "key.pem")
-	assert.NoError(t, err, "%v", err)
-
-	srv := createTestServer(t, &serverCert)
+	cert := GenerateCertificatesOrPanic()
+	srv := createTestServer(t, &cert)
 	defer srv.stop()
 
-	generateCertificates("key2.pem", "cert2.pem")
-	defer os.Remove("cert2.pem")
-	defer os.Remove("key2.pem")
-	clientCert, err := tls.LoadX509KeyPair("cert2.pem", "key2.pem")
+	clientCert := GenerateCertificatesOrPanic()
 	clientCertHash := certHashFromRawCert(clientCert.Certificate[0])
-	assert.NoError(t, err)
 	ta := credentials.NewTLS(&tls.Config{
 		Certificates:       []tls.Certificate{clientCert},
 		InsecureSkipVerify: true,
 	})
-	assert.NoError(t, err, "%v", err)
-	conn, err := grpc.Dial("localhost:5611", grpc.WithTransportCredentials(&authCreds{tlsCreds: ta}), grpc.WithBlock(), grpc.WithTimeout(time.Second))
+	ctx := context.Background()
+	ctx, _ = context.WithTimeout(ctx, time.Second)
+	conn, err := grpc.DialContext(ctx, "localhost:5611", grpc.WithTransportCredentials(ta), grpc.WithBlock())
 	assert.NoError(t, err, "%v", err)
 
 	cl := proto.NewGossipClient(conn)

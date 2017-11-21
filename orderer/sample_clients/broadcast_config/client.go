@@ -23,12 +23,17 @@ import (
 
 	"google.golang.org/grpc"
 
-	"github.com/hyperledger/fabric/orderer/localconfig"
+	genesisconfig "github.com/hyperledger/fabric/common/tools/configtxgen/localconfig"
+	"github.com/hyperledger/fabric/msp"
+	mspmgmt "github.com/hyperledger/fabric/msp/mgmt"
+	"github.com/hyperledger/fabric/orderer/common/localconfig"
 	cb "github.com/hyperledger/fabric/protos/common"
 	ab "github.com/hyperledger/fabric/protos/orderer"
 )
 
 var conf *config.TopLevel
+var genConf *genesisconfig.Profile
+var signer msp.SigningIdentity
 
 type broadcastClient struct {
 	ab.AtomicBroadcast_BroadcastClient
@@ -67,6 +72,19 @@ type argsImpl struct {
 
 func init() {
 	conf = config.Load()
+	genConf = genesisconfig.Load(genesisconfig.SampleInsecureSoloProfile)
+
+	// Load local MSP
+	err := mspmgmt.LoadLocalMsp(conf.General.LocalMSPDir, conf.General.BCCSP, conf.General.LocalMSPID)
+	if err != nil {
+		panic(fmt.Errorf("Failed to initialize local MSP: %s", err))
+	}
+
+	localmsp := mspmgmt.GetLocalMSP()
+	signer, err = localmsp.GetDefaultSigningIdentity()
+	if err != nil {
+		panic(fmt.Errorf("Failed to initialize get default signer: %s", err))
+	}
 }
 
 func main() {
@@ -75,9 +93,9 @@ func main() {
 
 	flag.StringVar(&srv, "server", fmt.Sprintf("%s:%d", conf.General.ListenAddress, conf.General.ListenPort), "The RPC server to connect to.")
 	flag.StringVar(&cmd.name, "cmd", "newChain", "The action that this client is requesting via the config transaction.")
-	flag.StringVar(&cmd.args.consensusType, "consensusType", conf.Genesis.OrdererType, "In case of a newChain command, the type of consensus the ordering service is running on.")
+	flag.StringVar(&cmd.args.consensusType, "consensusType", genConf.Orderer.OrdererType, "In case of a newChain command, the type of consensus the ordering service is running on.")
 	flag.StringVar(&cmd.args.creationPolicy, "creationPolicy", "AcceptAllPolicy", "In case of a newChain command, the chain creation policy this request should be validated against.")
-	flag.StringVar(&cmd.args.chainID, "chainID", "NewChainID", "In case of a newChain command, the chain ID to create.")
+	flag.StringVar(&cmd.args.chainID, "chainID", "mychannel", "In case of a newChain command, the chain ID to create.")
 	flag.Parse()
 
 	conn, err := grpc.Dial(srv, grpc.WithInsecure())

@@ -1,44 +1,63 @@
 /*
-Copyright IBM Corp. 2016 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-		 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package msp
 
 import (
-	"crypto/x509"
-	"fmt"
-	"time"
-
-	"encoding/pem"
-
 	"bytes"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/hex"
+	"encoding/pem"
+	"fmt"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/hyperledger/fabric/bccsp"
+	"github.com/hyperledger/fabric/bccsp/factory"
 	"github.com/hyperledger/fabric/bccsp/signer"
-	"github.com/hyperledger/fabric/bccsp/sw"
-	"github.com/hyperledger/fabric/protos/common"
 	m "github.com/hyperledger/fabric/protos/msp"
-	"github.com/syndtr/goleveldb/leveldb/errors"
+	"github.com/pkg/errors"
 )
+
+// mspSetupFuncType is the prototype of the setup function
+type mspSetupFuncType func(config *m.FabricMSPConfig) error
+
+// validateIdentityOUsFuncType is the prototype of the function to validate identity's OUs
+type validateIdentityOUsFuncType func(id *identity) error
 
 // This is an instantiation of an MSP that
 // uses BCCSP for its cryptographic primitives.
 type bccspmsp struct {
-	// list of certs we trust
-	trustedCerts []Identity
+	// version specifies the behaviour of this msp
+	version MSPVersion
+	// The following function pointers are used to change the behaviour
+	// of this MSP depending on its version.
+	// internalSetupFunc is the pointer to the setup function
+	internalSetupFunc mspSetupFuncType
+
+	// internalValidateIdentityOusFunc is the pointer to the function to validate identity's OUs
+	internalValidateIdentityOusFunc validateIdentityOUsFuncType
+
+	// list of CA certs we trust
+	rootCerts []Identity
+
+	// list of intermediate certs we trust
+	intermediateCerts []Identity
+
+	// list of CA TLS certs we trust
+	tlsRootCerts [][]byte
+
+	// list of intermediate TLS certs we trust
+	tlsIntermediateCerts [][]byte
+
+	// certificationTreeInternalNodesMap whose keys correspond to the raw material
+	// (DER representation) of a certificate casted to a string, and whose values
+	// are boolean. True means that the certificate is an internal node of the certification tree.
+	// False means that the certificate corresponds to a leaf of the certification tree.
+	certificationTreeInternalNodesMap map[string]bool
 
 	// list of signing identities
 	signer SigningIdentity
@@ -51,87 +70,124 @@ type bccspmsp struct {
 
 	// the provider identifier for this MSP
 	name string
+
+	// verification options for MSP members
+	opts *x509.VerifyOptions
+
+	// list of certificate revocation lists
+	CRL []*pkix.CertificateList
+
+	// list of OUs
+	ouIdentifiers map[string][][]byte
+
+	// cryptoConfig contains
+	cryptoConfig *m.FabricCryptoConfig
+
+	// NodeOUs configuration
+	ouEnforcement bool
+	// These are the OUIdentifiers of the clients, peers and orderers.
+	// They are used to tell apart these entities
+	clientOU, peerOU, ordererOU *OUIdentifier
 }
 
-// NewBccspMsp returns an MSP instance backed up by a BCCSP
+// newBccspMsp returns an MSP instance backed up by a BCCSP
 // crypto provider. It handles x.509 certificates and can
 // generate identities and signing identities backed by
 // certificates and keypairs
-func NewBccspMsp() (MSP, error) {
-	mspLogger.Infof("Creating BCCSP-based MSP instance")
+func newBccspMsp(version MSPVersion) (MSP, error) {
+	mspLogger.Debugf("Creating BCCSP-based MSP instance")
 
-	// TODO: security level, hash family and keystore should
-	// be probably set in the appropriate way.
-	bccsp, err := sw.NewDefaultSecurityLevelWithKeystore(&sw.DummyKeyStore{})
-	if err != nil {
-		return nil, fmt.Errorf("Failed initiliazing BCCSP [%s]", err)
-	}
-
+	bccsp := factory.GetDefault()
 	theMsp := &bccspmsp{}
+	theMsp.version = version
 	theMsp.bccsp = bccsp
+	switch version {
+	case MSPv1_0:
+		theMsp.internalSetupFunc = theMsp.setupV1
+		theMsp.internalValidateIdentityOusFunc = theMsp.validateIdentityOUsV1
+	case MSPv1_1:
+		theMsp.internalSetupFunc = theMsp.setupV11
+		theMsp.internalValidateIdentityOusFunc = theMsp.validateIdentityOUsV11
+	default:
+		return nil, errors.Errorf("Invalid MSP version [%v]", version)
+	}
 
 	return theMsp, nil
 }
 
-func (msp *bccspmsp) getIdentityFromConf(idBytes []byte) (Identity, error) {
+func (msp *bccspmsp) getCertFromPem(idBytes []byte) (*x509.Certificate, error) {
 	if idBytes == nil {
-		return nil, fmt.Errorf("getIdentityFromBytes error: nil idBytes")
+		return nil, errors.New("getCertFromPem error: nil idBytes")
 	}
 
 	// Decode the pem bytes
 	pemCert, _ := pem.Decode(idBytes)
 	if pemCert == nil {
-		return nil, fmt.Errorf("getIdentityFromBytes error: could not decode pem bytes")
+		return nil, errors.Errorf("getCertFromPem error: could not decode pem bytes [%v]", idBytes)
 	}
 
 	// get a cert
 	var cert *x509.Certificate
 	cert, err := x509.ParseCertificate(pemCert.Bytes)
 	if err != nil {
-		return nil, fmt.Errorf("getIdentityFromBytes error: failed to parse x509 cert, err %s", err)
+		return nil, errors.Wrap(err, "getCertFromPem error: failed to parse x509 cert")
+	}
+
+	return cert, nil
+}
+
+func (msp *bccspmsp) getIdentityFromConf(idBytes []byte) (Identity, bccsp.Key, error) {
+	// get a cert
+	cert, err := msp.getCertFromPem(idBytes)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	// get the public key in the right format
 	certPubK, err := msp.bccsp.KeyImport(cert, &bccsp.X509PublicKeyImportOpts{Temporary: true})
+
+	mspId, err := newIdentity(cert, certPubK, msp)
 	if err != nil {
-		return nil, fmt.Errorf("getIdentityFromBytes error: failed to import certitifacate's public key [%s]", err)
+		return nil, nil, err
 	}
 
-	return newIdentity(&IdentityIdentifier{
-		Mspid: msp.name,
-		Id:    "IDENTITY"}, /* FIXME: not clear where we would get the identifier for this identity */
-		cert, certPubK, msp), nil
+	return mspId, certPubK, nil
 }
 
 func (msp *bccspmsp) getSigningIdentityFromConf(sidInfo *m.SigningIdentityInfo) (SigningIdentity, error) {
 	if sidInfo == nil {
-		return nil, fmt.Errorf("getIdentityFromBytes error: nil sidInfo")
+		return nil, errors.New("getIdentityFromBytes error: nil sidInfo")
 	}
 
-	// extract the public part of the identity
-	idPub, err := msp.getIdentityFromConf(sidInfo.PublicSigner)
+	// Extract the public part of the identity
+	idPub, pubKey, err := msp.getIdentityFromConf(sidInfo.PublicSigner)
 	if err != nil {
 		return nil, err
 	}
 
-	// Get secret key
-	pemKey, _ := pem.Decode(sidInfo.PrivateSigner.KeyMaterial)
-	key, err := msp.bccsp.KeyImport(pemKey.Bytes, &bccsp.ECDSAPrivateKeyImportOpts{Temporary: true})
+	// Find the matching private key in the BCCSP keystore
+	privKey, err := msp.bccsp.GetKey(pubKey.SKI())
+	// Less Secure: Attempt to import Private Key from KeyInfo, if BCCSP was not able to find the key
 	if err != nil {
-		return nil, fmt.Errorf("getIdentityFromBytes error: Failed to import EC private key, err %s", err)
+		mspLogger.Debugf("Could not find SKI [%s], trying KeyMaterial field: %+v\n", hex.EncodeToString(pubKey.SKI()), err)
+		if sidInfo.PrivateSigner == nil || sidInfo.PrivateSigner.KeyMaterial == nil {
+			return nil, errors.New("KeyMaterial not found in SigningIdentityInfo")
+		}
+
+		pemKey, _ := pem.Decode(sidInfo.PrivateSigner.KeyMaterial)
+		privKey, err = msp.bccsp.KeyImport(pemKey.Bytes, &bccsp.ECDSAPrivateKeyImportOpts{Temporary: true})
+		if err != nil {
+			return nil, errors.WithMessage(err, "getIdentityFromBytes error: Failed to import EC private key")
+		}
 	}
 
 	// get the peer signer
-	peerSigner := &signer.CryptoSigner{}
-	err = peerSigner.Init(msp.bccsp, key)
+	peerSigner, err := signer.New(msp.bccsp, privKey)
 	if err != nil {
-		return nil, fmt.Errorf("getIdentityFromBytes error: Failed initializing CryptoSigner, err %s", err)
+		return nil, errors.WithMessage(err, "getIdentityFromBytes error: Failed initializing bccspCryptoSigner")
 	}
 
-	return newSigningIdentity(&IdentityIdentifier{
-		Mspid: msp.name,
-		Id:    "DEFAULT"}, /* FIXME: not clear where we would get the identifier for this identity */
-		idPub.(*identity).cert, idPub.(*identity).pk, peerSigner, msp), nil
+	return newSigningIdentity(idPub.(*identity).cert, idPub.(*identity).pk, peerSigner, msp)
 }
 
 // Setup sets up the internal data structures
@@ -139,53 +195,27 @@ func (msp *bccspmsp) getSigningIdentityFromConf(sidInfo *m.SigningIdentityInfo) 
 // returns nil in case of success or an error otherwise
 func (msp *bccspmsp) Setup(conf1 *m.MSPConfig) error {
 	if conf1 == nil {
-		return fmt.Errorf("Setup error: nil conf reference")
+		return errors.New("Setup error: nil conf reference")
 	}
 
 	// given that it's an msp of type fabric, extract the MSPConfig instance
-	var conf m.FabricMSPConfig
-	err := proto.Unmarshal(conf1.Config, &conf)
+	conf := &m.FabricMSPConfig{}
+	err := proto.Unmarshal(conf1.Config, conf)
 	if err != nil {
-		return fmt.Errorf("Failed unmarshalling fabric msp config, err %s", err)
+		return errors.Wrap(err, "failed unmarshalling fabric msp config")
 	}
 
 	// set the name for this msp
 	msp.name = conf.Name
-	mspLogger.Infof("Setting up MSP instance %s", msp.name)
+	mspLogger.Debugf("Setting up MSP instance %s", msp.name)
 
-	// make and fill the set of admin certs
-	msp.admins = make([]Identity, len(conf.Admins))
-	for i, admCert := range conf.Admins {
-		id, err := msp.getIdentityFromConf(admCert)
-		if err != nil {
-			return err
-		}
+	// setup
+	return msp.internalSetupFunc(conf)
+}
 
-		msp.admins[i] = id
-	}
-
-	// make and fill the set of CA certs
-	msp.trustedCerts = make([]Identity, len(conf.RootCerts))
-	for i, trustedCert := range conf.RootCerts {
-		id, err := msp.getIdentityFromConf(trustedCert)
-		if err != nil {
-			return err
-		}
-
-		msp.trustedCerts[i] = id
-	}
-
-	// setup the signer (if present)
-	if conf.SigningIdentity != nil {
-		sid, err := msp.getSigningIdentityFromConf(conf.SigningIdentity)
-		if err != nil {
-			return err
-		}
-
-		msp.signer = sid
-	}
-
-	return nil
+// GetVersion returns the version of this MSP
+func (msp *bccspmsp) GetVersion() MSPVersion {
+	return msp.version
 }
 
 // GetType returns the type for this MSP
@@ -198,13 +228,23 @@ func (msp *bccspmsp) GetIdentifier() (string, error) {
 	return msp.name, nil
 }
 
+// GetTLSRootCerts returns the root certificates for this MSP
+func (msp *bccspmsp) GetTLSRootCerts() [][]byte {
+	return msp.tlsRootCerts
+}
+
+// GetTLSIntermediateCerts returns the intermediate root certificates for this MSP
+func (msp *bccspmsp) GetTLSIntermediateCerts() [][]byte {
+	return msp.tlsIntermediateCerts
+}
+
 // GetDefaultSigningIdentity returns the
 // default signing identity for this MSP (if any)
 func (msp *bccspmsp) GetDefaultSigningIdentity() (SigningIdentity, error) {
-	mspLogger.Infof("Obtaining default signing identity")
+	mspLogger.Debugf("Obtaining default signing identity")
 
 	if msp.signer == nil {
-		return nil, fmt.Errorf("This MSP does not possess a valid default signing identity")
+		return nil, errors.New("this MSP does not possess a valid default signing identity")
 	}
 
 	return msp.signer, nil
@@ -214,7 +254,7 @@ func (msp *bccspmsp) GetDefaultSigningIdentity() (SigningIdentity, error) {
 // identity identified by the supplied identifier
 func (msp *bccspmsp) GetSigningIdentity(identifier *IdentityIdentifier) (SigningIdentity, error) {
 	// TODO
-	return nil, nil
+	return nil, errors.Errorf("no signing identity for %#v", identifier)
 }
 
 // Validate attempts to determine whether
@@ -223,132 +263,320 @@ func (msp *bccspmsp) GetSigningIdentity(identifier *IdentityIdentifier) (Signing
 // nil in case the identity is valid or an
 // error otherwise
 func (msp *bccspmsp) Validate(id Identity) error {
-	mspLogger.Infof("MSP %s validating identity", msp.name)
+	mspLogger.Debugf("MSP %s validating identity", msp.name)
 
-	switch id.(type) {
+	switch id := id.(type) {
 	// If this identity is of this specific type,
 	// this is how I can validate it given the
 	// root of trust this MSP has
 	case *identity:
-		opts := x509.VerifyOptions{
-			Roots:       x509.NewCertPool(),
-			CurrentTime: time.Now(),
-		}
-
-		for _, v := range msp.trustedCerts {
-			opts.Roots.AddCert(v.(*identity).cert)
-		}
-
-		_, err := id.(*identity).cert.Verify(opts)
-		if err != nil {
-			return fmt.Errorf("The supplied identity is not valid, Verify() returned %s", err)
-		} else {
-			return nil
-		}
+		return msp.validateIdentity(id)
 	default:
-		return fmt.Errorf("Identity type not recognized")
+		return errors.New("identity type not recognized")
 	}
 }
 
-// DeserializeIdentity returns an Identity
-// instance that was marshalled to the supplied byte array
+// DeserializeIdentity returns an Identity given the byte-level
+// representation of a SerializedIdentity struct
 func (msp *bccspmsp) DeserializeIdentity(serializedID []byte) (Identity, error) {
 	mspLogger.Infof("Obtaining identity")
 
-	// FIXME: this is not ideal, because the manager already does this
-	// unmarshalling if we go through it; however the local MSP does
-	// not have a manager and in case it has to deserialize an identity,
-	// it will have to do the whole thing by itself; for now I've left
-	// it this way but we can introduce a local MSP manager and fix it
-	// more nicely
-
 	// We first deserialize to a SerializedIdentity to get the MSP ID
-	sId := &SerializedIdentity{}
+	sId := &m.SerializedIdentity{}
 	err := proto.Unmarshal(serializedID, sId)
 	if err != nil {
-		return nil, fmt.Errorf("Could not deserialize a SerializedIdentity, err %s", err)
+		return nil, errors.Wrap(err, "could not deserialize a SerializedIdentity")
 	}
 
-	// TODO: check that sId.Mspid is equal to this msp'id as per contract of the interface.
+	if sId.Mspid != msp.name {
+		return nil, errors.Errorf("expected MSP ID %s, received %s", msp.name, sId.Mspid)
+	}
 
+	return msp.deserializeIdentityInternal(sId.IdBytes)
+}
+
+// deserializeIdentityInternal returns an identity given its byte-level representation
+func (msp *bccspmsp) deserializeIdentityInternal(serializedIdentity []byte) (Identity, error) {
 	// This MSP will always deserialize certs this way
-	bl, _ := pem.Decode(sId.IdBytes)
+	bl, _ := pem.Decode(serializedIdentity)
 	if bl == nil {
-		return nil, fmt.Errorf("Could not decode the PEM structure")
+		return nil, errors.New("could not decode the PEM structure")
 	}
 	cert, err := x509.ParseCertificate(bl.Bytes)
 	if err != nil {
-		return nil, fmt.Errorf("ParseCertificate failed %s", err)
+		return nil, errors.Wrap(err, "parseCertificate failed")
 	}
 
 	// Now we have the certificate; make sure that its fields
 	// (e.g. the Issuer.OU or the Subject.OU) match with the
 	// MSP id that this MSP has; otherwise it might be an attack
 	// TODO!
-	// TODO!
-	// TODO!
-	// TODO!
 	// We can't do it yet because there is no standardized way
 	// (yet) to encode the MSP ID into the x.509 body of a cert
 
-	id := &IdentityIdentifier{Mspid: msp.name,
-		Id: "DEFAULT"} // TODO: where should this identifier be obtained from?
-
 	pub, err := msp.bccsp.KeyImport(cert, &bccsp.X509PublicKeyImportOpts{Temporary: true})
 	if err != nil {
-		return nil, fmt.Errorf("Failed to import certitifacateś public key [%s]", err)
+		return nil, errors.WithMessage(err, "failed to import certificate's public key")
 	}
 
-	return newIdentity(id, cert, pub, msp), nil
+	return newIdentity(cert, pub, msp)
 }
 
 // SatisfiesPrincipal returns null if the identity matches the principal or an error otherwise
-func (msp *bccspmsp) SatisfiesPrincipal(id Identity, principal *common.MSPPrincipal) error {
+func (msp *bccspmsp) SatisfiesPrincipal(id Identity, principal *m.MSPPrincipal) error {
 	switch principal.PrincipalClassification {
 	// in this case, we have to check whether the
 	// identity has a role in the msp - member or admin
-	case common.MSPPrincipal_ByMSPRole:
+	case m.MSPPrincipal_ROLE:
 		// Principal contains the msp role
-		mspRole := &common.MSPRole{}
+		mspRole := &m.MSPRole{}
 		err := proto.Unmarshal(principal.Principal, mspRole)
 		if err != nil {
-			return fmt.Errorf("Could not unmarshal MSPRole from principal, err %s", err)
+			return errors.Wrap(err, "could not unmarshal MSPRole from principal")
 		}
 
 		// at first, we check whether the MSP
 		// identifier is the same as that of the identity
-		if mspRole.MSPIdentifier != msp.name {
-			return fmt.Errorf("The identity is a member of a different MSP (expected %s, got %s)", mspRole.MSPIdentifier, id.GetMSPIdentifier())
+		if mspRole.MspIdentifier != msp.name {
+			return errors.Errorf("the identity is a member of a different MSP (expected %s, got %s)", mspRole.MspIdentifier, id.GetMSPIdentifier())
 		}
 
 		// now we validate the different msp roles
 		switch mspRole.Role {
-		// in the case of member, we simply check
-		// whether this identity is valid for the MSP
-		case common.MSPRole_Member:
+		case m.MSPRole_MEMBER:
+			// in the case of member, we simply check
+			// whether this identity is valid for the MSP
+			mspLogger.Debugf("Checking if identity satisfies MEMBER role for %s", msp.name)
 			return msp.Validate(id)
-		case common.MSPRole_Admin:
-			panic("Not yet implemented")
+		case m.MSPRole_ADMIN:
+			mspLogger.Debugf("Checking if identity satisfies ADMIN role for %s", msp.name)
+			// in the case of admin, we check that the
+			// id is exactly one of our admins
+			for _, admincert := range msp.admins {
+				if bytes.Equal(id.(*identity).cert.Raw, admincert.(*identity).cert.Raw) {
+					// we do not need to check whether the admin is a valid identity
+					// according to this MSP, since we already check this at Setup time
+					// if there is a match, we can just return
+					return nil
+				}
+			}
+
+			return errors.New("This identity is not an admin")
 		default:
-			return fmt.Errorf("Invalid MSP role type %d", int32(mspRole.Role))
+			return errors.Errorf("invalid MSP role type %d", int32(mspRole.Role))
 		}
-	// in this case we have to serialize this instance
-	// and compare it byte-by-byte with Principal
-	case common.MSPPrincipal_ByIdentity:
-		idBytes, err := id.Serialize()
+	case m.MSPPrincipal_IDENTITY:
+		// in this case we have to deserialize the principal's identity
+		// and compare it byte-by-byte with our cert
+		principalId, err := msp.DeserializeIdentity(principal.Principal)
 		if err != nil {
-			return fmt.Errorf("Could not serialize this identity instance, err %s", err)
+			return errors.WithMessage(err, "invalid identity principal, not a certificate")
 		}
 
-		rv := bytes.Compare(idBytes, principal.Principal)
-		if rv == 0 {
-			return nil
-		} else {
-			return errors.New("The identities do not match")
+		if bytes.Equal(id.(*identity).cert.Raw, principalId.(*identity).cert.Raw) {
+			return principalId.Validate()
 		}
-	case common.MSPPrincipal_ByOrganizationUnit:
-		panic("Not yet implemented")
+
+		return errors.New("The identities do not match")
+	case m.MSPPrincipal_ORGANIZATION_UNIT:
+		// Principal contains the OrganizationUnit
+		OU := &m.OrganizationUnit{}
+		err := proto.Unmarshal(principal.Principal, OU)
+		if err != nil {
+			return errors.Wrap(err, "could not unmarshal OrganizationUnit from principal")
+		}
+
+		// at first, we check whether the MSP
+		// identifier is the same as that of the identity
+		if OU.MspIdentifier != msp.name {
+			return errors.Errorf("the identity is a member of a different MSP (expected %s, got %s)", OU.MspIdentifier, id.GetMSPIdentifier())
+		}
+
+		// we then check if the identity is valid with this MSP
+		// and fail if it is not
+		err = msp.Validate(id)
+		if err != nil {
+			return err
+		}
+
+		// now we check whether any of this identity's OUs match the requested one
+		for _, ou := range id.GetOrganizationalUnits() {
+			if ou.OrganizationalUnitIdentifier == OU.OrganizationalUnitIdentifier &&
+				bytes.Equal(ou.CertifiersIdentifier, OU.CertifiersIdentifier) {
+				return nil
+			}
+		}
+
+		// if we are here, no match was found, return an error
+		return errors.New("The identities do not match")
 	default:
-		return fmt.Errorf("Invalid principal type %d", int32(principal.PrincipalClassification))
+		return errors.Errorf("invalid principal type %d", int32(principal.PrincipalClassification))
 	}
+}
+
+// getCertificationChain returns the certification chain of the passed identity within this msp
+func (msp *bccspmsp) getCertificationChain(id Identity) ([]*x509.Certificate, error) {
+	mspLogger.Debugf("MSP %s getting certification chain", msp.name)
+
+	switch id := id.(type) {
+	// If this identity is of this specific type,
+	// this is how I can validate it given the
+	// root of trust this MSP has
+	case *identity:
+		return msp.getCertificationChainForBCCSPIdentity(id)
+	default:
+		return nil, errors.New("identity type not recognized")
+	}
+}
+
+// getCertificationChainForBCCSPIdentity returns the certification chain of the passed bccsp identity within this msp
+func (msp *bccspmsp) getCertificationChainForBCCSPIdentity(id *identity) ([]*x509.Certificate, error) {
+	if id == nil {
+		return nil, errors.New("Invalid bccsp identity. Must be different from nil.")
+	}
+
+	// we expect to have a valid VerifyOptions instance
+	if msp.opts == nil {
+		return nil, errors.New("Invalid msp instance")
+	}
+
+	// CAs cannot be directly used as identities..
+	if id.cert.IsCA {
+		return nil, errors.New("A CA certificate cannot be used directly by this MSP")
+	}
+
+	return msp.getValidationChain(id.cert, false)
+}
+
+func (msp *bccspmsp) getUniqueValidationChain(cert *x509.Certificate, opts x509.VerifyOptions) ([]*x509.Certificate, error) {
+	// ask golang to validate the cert for us based on the options that we've built at setup time
+	if msp.opts == nil {
+		return nil, errors.New("the supplied identity has no verify options")
+	}
+	validationChains, err := cert.Verify(opts)
+	if err != nil {
+		return nil, errors.WithMessage(err, "the supplied identity is not valid")
+	}
+
+	// we only support a single validation chain;
+	// if there's more than one then there might
+	// be unclarity about who owns the identity
+	if len(validationChains) != 1 {
+		return nil, errors.Errorf("this MSP only supports a single validation chain, got %d", len(validationChains))
+	}
+
+	return validationChains[0], nil
+}
+
+func (msp *bccspmsp) getValidationChain(cert *x509.Certificate, isIntermediateChain bool) ([]*x509.Certificate, error) {
+	validationChain, err := msp.getUniqueValidationChain(cert, msp.getValidityOptsForCert(cert))
+	if err != nil {
+		return nil, errors.WithMessage(err, "failed getting validation chain")
+	}
+
+	// we expect a chain of length at least 2
+	if len(validationChain) < 2 {
+		return nil, errors.Errorf("expected a chain of length at least 2, got %d", len(validationChain))
+	}
+
+	// check that the parent is a leaf of the certification tree
+	// if validating an intermediate chain, the first certificate will the parent
+	parentPosition := 1
+	if isIntermediateChain {
+		parentPosition = 0
+	}
+	if msp.certificationTreeInternalNodesMap[string(validationChain[parentPosition].Raw)] {
+		return nil, errors.Errorf("invalid validation chain. Parent certificate should be a leaf of the certification tree [%v]", cert.Raw)
+	}
+	return validationChain, nil
+}
+
+// getCertificationChainIdentifier returns the certification chain identifier of the passed identity within this msp.
+// The identifier is computes as the SHA256 of the concatenation of the certificates in the chain.
+func (msp *bccspmsp) getCertificationChainIdentifier(id Identity) ([]byte, error) {
+	chain, err := msp.getCertificationChain(id)
+	if err != nil {
+		return nil, errors.WithMessage(err, fmt.Sprintf("failed getting certification chain for [%v]", id))
+	}
+
+	// chain[0] is the certificate representing the identity.
+	// It will be discarded
+	return msp.getCertificationChainIdentifierFromChain(chain[1:])
+}
+
+func (msp *bccspmsp) getCertificationChainIdentifierFromChain(chain []*x509.Certificate) ([]byte, error) {
+	// Hash the chain
+	// Use the hash of the identity's certificate as id in the IdentityIdentifier
+	hashOpt, err := bccsp.GetHashOpt(msp.cryptoConfig.IdentityIdentifierHashFunction)
+	if err != nil {
+		return nil, errors.WithMessage(err, "failed getting hash function options")
+	}
+
+	hf, err := msp.bccsp.GetHash(hashOpt)
+	if err != nil {
+		return nil, errors.WithMessage(err, "failed getting hash function when computing certification chain identifier")
+	}
+	for i := 0; i < len(chain); i++ {
+		hf.Write(chain[i].Raw)
+	}
+	return hf.Sum(nil), nil
+}
+
+// sanitizeCert ensures that x509 certificates signed using ECDSA
+// do have signatures in Low-S. If this is not the case, the certificate
+// is regenerated to have a Low-S signature.
+func (msp *bccspmsp) sanitizeCert(cert *x509.Certificate) (*x509.Certificate, error) {
+	if isECDSASignedCert(cert) {
+		// Lookup for a parent certificate to perform the sanitization
+		var parentCert *x509.Certificate
+		if cert.IsCA {
+			// at this point, cert might be a root CA certificate
+			// or an intermediate CA certificate
+			chain, err := msp.getUniqueValidationChain(cert, msp.getValidityOptsForCert(cert))
+			if err != nil {
+				return nil, err
+			}
+			if len(chain) == 1 {
+				// cert is a root CA certificate
+				parentCert = cert
+			} else {
+				// cert is an intermediate CA certificate
+				parentCert = chain[1]
+			}
+		} else {
+			chain, err := msp.getUniqueValidationChain(cert, msp.getValidityOptsForCert(cert))
+			if err != nil {
+				return nil, err
+			}
+			parentCert = chain[1]
+		}
+
+		// Sanitize
+		var err error
+		cert, err = sanitizeECDSASignedCert(cert, parentCert)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return cert, nil
+}
+
+// IsWellFormed checks if the given identity can be deserialized into its provider-specific form.
+// In this MSP implementation, well formed means that the PEM has a Type which is either
+// the string 'CERTIFICATE' or the Type is missing altogether.
+func (msp *bccspmsp) IsWellFormed(identity *m.SerializedIdentity) error {
+	bl, _ := pem.Decode(identity.IdBytes)
+	if bl == nil {
+		return errors.New("PEM decoding resulted in an empty block")
+	}
+	// Important: This method looks very similar to getCertFromPem(idBytes []byte) (*x509.Certificate, error)
+	// But we:
+	// 1) Must ensure PEM block is of type CERTIFICATE or is empty
+	// 2) Must not replace getCertFromPem with this method otherwise we will introduce
+	//    a change in validation logic which will result in a chain fork.
+	if bl.Type != "CERTIFICATE" && bl.Type != "" {
+		return errors.Errorf("pem type is %s, should be 'CERTIFICATE' or missing", bl.Type)
+	}
+	_, err := x509.ParseCertificate(bl.Bytes)
+	return err
 }

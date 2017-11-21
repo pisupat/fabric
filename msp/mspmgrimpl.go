@@ -17,18 +17,20 @@ limitations under the License.
 package msp
 
 import (
-	"fmt"
-
 	"github.com/golang/protobuf/proto"
+	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/protos/msp"
-	"github.com/op/go-logging"
+	"github.com/pkg/errors"
 )
 
-var mspLogger = logging.MustGetLogger("msp")
+var mspLogger = flogging.MustGetLogger("msp")
 
 type mspManagerImpl struct {
 	// map that contains all MSPs that we have setup or otherwise added
 	mspsMap map[string]MSP
+
+	// map that maps MSPs by their provider types
+	mspsByProviders map[ProviderType][]MSP
 
 	// error that might have occurred at startup
 	up bool
@@ -42,56 +44,34 @@ func NewMSPManager() MSPManager {
 }
 
 // Setup initializes the internal data structures of this manager and creates MSPs
-func (mgr *mspManagerImpl) Setup(msps []*msp.MSPConfig) error {
+func (mgr *mspManagerImpl) Setup(msps []MSP) error {
 	if mgr.up {
 		mspLogger.Infof("MSP manager already up")
 		return nil
 	}
 
-	if msps == nil {
-		return fmt.Errorf("Setup error: nil config object")
-	}
-
-	if len(msps) == 0 {
-		return fmt.Errorf("Setup error: at least one MSP configuration item is required")
-	}
-
-	mspLogger.Infof("Setting up the MSP manager (%d msps)", len(msps))
+	mspLogger.Debugf("Setting up the MSP manager (%d msps)", len(msps))
 
 	// create the map that assigns MSP IDs to their manager instance - once
 	mgr.mspsMap = make(map[string]MSP)
 
-	for _, mspConf := range msps {
-		// check that the type for that MSP is supported
-		if mspConf.Type != int32(FABRIC) {
-			return fmt.Errorf("Setup error: unsupported msp type %d", mspConf.Type)
-		}
+	// create the map that sorts MSPs by their provider types
+	mgr.mspsByProviders = make(map[ProviderType][]MSP)
 
-		mspLogger.Infof("Setting up MSP")
-
-		// create the msp instance
-		msp, err := NewBccspMsp()
-		if err != nil {
-			return fmt.Errorf("Creating the MSP manager failed, err %s", err)
-		}
-
-		// set it up
-		err = msp.Setup(mspConf)
-		if err != nil {
-			return fmt.Errorf("Setting up the MSP manager failed, err %s", err)
-		}
-
+	for _, msp := range msps {
 		// add the MSP to the map of active MSPs
 		mspID, err := msp.GetIdentifier()
 		if err != nil {
-			return fmt.Errorf("Could not extract msp identifier, err %s", err)
+			return errors.WithMessage(err, "could not extract msp identifier")
 		}
 		mgr.mspsMap[mspID] = msp
+		providerType := msp.GetType()
+		mgr.mspsByProviders[providerType] = append(mgr.mspsByProviders[providerType], msp)
 	}
 
 	mgr.up = true
 
-	mspLogger.Infof("MSP manager setup complete, setup %d msps", len(msps))
+	mspLogger.Debugf("MSP manager setup complete, setup %d msps", len(msps))
 
 	return nil
 }
@@ -104,18 +84,37 @@ func (mgr *mspManagerImpl) GetMSPs() (map[string]MSP, error) {
 // DeserializeIdentity returns an identity given its serialized version supplied as argument
 func (mgr *mspManagerImpl) DeserializeIdentity(serializedID []byte) (Identity, error) {
 	// We first deserialize to a SerializedIdentity to get the MSP ID
-	sId := &SerializedIdentity{}
+	sId := &msp.SerializedIdentity{}
 	err := proto.Unmarshal(serializedID, sId)
 	if err != nil {
-		return nil, fmt.Errorf("Could not deserialize a SerializedIdentity, err %s", err)
+		return nil, errors.Wrap(err, "could not deserialize a SerializedIdentity")
 	}
 
 	// we can now attempt to obtain the MSP
 	msp := mgr.mspsMap[sId.Mspid]
 	if msp == nil {
-		return nil, fmt.Errorf("MSP %s is unknown", sId.Mspid)
+		return nil, errors.Errorf("MSP %s is unknown", sId.Mspid)
 	}
 
-	// if we have this MSP, we ask it to deserialize
-	return msp.DeserializeIdentity(serializedID)
+	switch t := msp.(type) {
+	case *bccspmsp:
+		return t.deserializeIdentityInternal(sId.IdBytes)
+	case *idemixmsp:
+		return t.deserializeIdentityInternal(sId.IdBytes)
+	default:
+		return t.DeserializeIdentity(serializedID)
+	}
+}
+
+func (mgr *mspManagerImpl) IsWellFormed(identity *msp.SerializedIdentity) error {
+	// Iterate over all the MSPs by their providers, and find at least 1 MSP that can attest
+	// that this identity is well formed
+	for _, mspList := range mgr.mspsByProviders {
+		// We are guaranteed to have at least 1 MSP in each list from the initialization at Setup()
+		msp := mspList[0]
+		if err := msp.IsWellFormed(identity); err == nil {
+			return nil
+		}
+	}
+	return errors.New("no MSP provider recognizes the identity")
 }

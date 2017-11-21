@@ -1,17 +1,7 @@
 /*
-Copyright IBM Corp. 2016 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-                 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package main
@@ -20,54 +10,62 @@ import (
 	"flag"
 	"fmt"
 	"math"
+	"os"
 
-	"github.com/hyperledger/fabric/orderer/common/bootstrap/provisional"
-	"github.com/hyperledger/fabric/orderer/localconfig"
+	"github.com/hyperledger/fabric/common/crypto"
+	"github.com/hyperledger/fabric/common/localmsp"
+	genesisconfig "github.com/hyperledger/fabric/common/tools/configtxgen/localconfig"
+	"github.com/hyperledger/fabric/common/tools/protolator"
+	mspmgmt "github.com/hyperledger/fabric/msp/mgmt"
+	"github.com/hyperledger/fabric/orderer/common/localconfig"
 	cb "github.com/hyperledger/fabric/protos/common"
 	ab "github.com/hyperledger/fabric/protos/orderer"
 	"github.com/hyperledger/fabric/protos/utils"
+
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 )
 
+var (
+	oldest  = &ab.SeekPosition{Type: &ab.SeekPosition_Oldest{Oldest: &ab.SeekOldest{}}}
+	newest  = &ab.SeekPosition{Type: &ab.SeekPosition_Newest{Newest: &ab.SeekNewest{}}}
+	maxStop = &ab.SeekPosition{Type: &ab.SeekPosition_Specified{Specified: &ab.SeekSpecified{Number: math.MaxUint64}}}
+)
+
 type deliverClient struct {
-	client  ab.AtomicBroadcast_DeliverClient
-	chainID string
+	client    ab.AtomicBroadcast_DeliverClient
+	channelID string
+	signer    crypto.LocalSigner
+	quiet     bool
 }
 
-func newDeliverClient(client ab.AtomicBroadcast_DeliverClient, chainID string) *deliverClient {
-	return &deliverClient{client: client, chainID: chainID}
+func newDeliverClient(client ab.AtomicBroadcast_DeliverClient, channelID string, signer crypto.LocalSigner, quiet bool) *deliverClient {
+	return &deliverClient{client: client, channelID: channelID, signer: signer, quiet: quiet}
 }
 
-func seekHelper(chainID string, start *ab.SeekPosition) *cb.Envelope {
-	return &cb.Envelope{
-		Payload: utils.MarshalOrPanic(&cb.Payload{
-			Header: &cb.Header{
-				ChainHeader: &cb.ChainHeader{
-					ChainID: chainID,
-				},
-				SignatureHeader: &cb.SignatureHeader{},
-			},
-
-			Data: utils.MarshalOrPanic(&ab.SeekInfo{
-				Start:    &ab.SeekPosition{Type: &ab.SeekPosition_Oldest{Oldest: &ab.SeekOldest{}}},
-				Stop:     &ab.SeekPosition{Type: &ab.SeekPosition_Specified{Specified: &ab.SeekSpecified{Number: math.MaxUint64}}},
-				Behavior: ab.SeekInfo_BLOCK_UNTIL_READY,
-			}),
-		}),
+func (r *deliverClient) seekHelper(start *ab.SeekPosition, stop *ab.SeekPosition) *cb.Envelope {
+	env, err := utils.CreateSignedEnvelope(cb.HeaderType_DELIVER_SEEK_INFO, r.channelID, r.signer, &ab.SeekInfo{
+		Start:    start,
+		Stop:     stop,
+		Behavior: ab.SeekInfo_BLOCK_UNTIL_READY,
+	}, 0, 0)
+	if err != nil {
+		panic(err)
 	}
+	return env
 }
 
 func (r *deliverClient) seekOldest() error {
-	return r.client.Send(seekHelper(r.chainID, &ab.SeekPosition{Type: &ab.SeekPosition_Oldest{Oldest: &ab.SeekOldest{}}}))
+	return r.client.Send(r.seekHelper(oldest, maxStop))
 }
 
 func (r *deliverClient) seekNewest() error {
-	return r.client.Send(seekHelper(r.chainID, &ab.SeekPosition{Type: &ab.SeekPosition_Newest{Newest: &ab.SeekNewest{}}}))
+	return r.client.Send(r.seekHelper(newest, maxStop))
 }
 
-func (r *deliverClient) seek(blockNumber uint64) error {
-	return r.client.Send(seekHelper(r.chainID, &ab.SeekPosition{Type: &ab.SeekPosition_Specified{Specified: &ab.SeekSpecified{Number: blockNumber}}}))
+func (r *deliverClient) seekSingle(blockNumber uint64) error {
+	specific := &ab.SeekPosition{Type: &ab.SeekPosition_Specified{Specified: &ab.SeekSpecified{Number: blockNumber}}}
+	return r.client.Send(r.seekHelper(specific, specific))
 }
 
 func (r *deliverClient) readUntilClose() {
@@ -83,7 +81,15 @@ func (r *deliverClient) readUntilClose() {
 			fmt.Println("Got status ", t)
 			return
 		case *ab.DeliverResponse_Block:
-			fmt.Println("Received block: ", t.Block)
+			if !r.quiet {
+				fmt.Println("Received block: ")
+				err := protolator.DeepMarshalJSON(os.Stdout, t.Block)
+				if err != nil {
+					fmt.Printf("  Error pretty printing block: %s", err)
+				}
+			} else {
+				fmt.Println("Received block: ", t.Block.Header.Number)
+			}
 		}
 	}
 }
@@ -91,12 +97,33 @@ func (r *deliverClient) readUntilClose() {
 func main() {
 	config := config.Load()
 
-	var chainID string
+	// Load local MSP
+	err := mspmgmt.LoadLocalMsp(config.General.LocalMSPDir, config.General.BCCSP, config.General.LocalMSPID)
+	if err != nil { // Handle errors reading the config file
+		fmt.Println("Failed to initialize local MSP:", err)
+		os.Exit(0)
+	}
+
+	signer := localmsp.NewSigner()
+
+	var channelID string
 	var serverAddr string
+	var seek int
+	var quiet bool
 
 	flag.StringVar(&serverAddr, "server", fmt.Sprintf("%s:%d", config.General.ListenAddress, config.General.ListenPort), "The RPC server to connect to.")
-	flag.StringVar(&chainID, "chainID", provisional.TestChainID, "The chain ID to deliver from.")
+	flag.StringVar(&channelID, "channelID", genesisconfig.TestChainID, "The channel ID to deliver from.")
+	flag.BoolVar(&quiet, "quiet", false, "Only print the block number, will not attempt to print its block contents.")
+	flag.IntVar(&seek, "seek", -2, "Specify the range of requested blocks."+
+		"Acceptable values:"+
+		"-2 (or -1) to start from oldest (or newest) and keep at it indefinitely."+
+		"N >= 0 to fetch block N only.")
 	flag.Parse()
+
+	if seek < -2 {
+		fmt.Println("Wrong seek value.")
+		flag.PrintDefaults()
+	}
 
 	conn, err := grpc.Dial(serverAddr, grpc.WithInsecure())
 	if err != nil {
@@ -109,8 +136,16 @@ func main() {
 		return
 	}
 
-	s := newDeliverClient(client, chainID)
-	err = s.seekOldest()
+	s := newDeliverClient(client, channelID, signer, quiet)
+	switch seek {
+	case -2:
+		err = s.seekOldest()
+	case -1:
+		err = s.seekNewest()
+	default:
+		err = s.seekSingle(uint64(seek))
+	}
+
 	if err != nil {
 		fmt.Println("Received error:", err)
 	}

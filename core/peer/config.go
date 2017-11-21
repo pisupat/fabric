@@ -1,17 +1,7 @@
 /*
-Copyright IBM Corp. 2016 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-		 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 // The 'viper' package for configuration handling is very flexible, but has
@@ -31,10 +21,14 @@ package peer
 
 import (
 	"fmt"
+	"io/ioutil"
 	"net"
+	"path/filepath"
 
 	"github.com/spf13/viper"
 
+	"github.com/hyperledger/fabric/core/comm"
+	"github.com/hyperledger/fabric/core/config"
 	pb "github.com/hyperledger/fabric/protos/peer"
 )
 
@@ -49,16 +43,6 @@ var peerEndpoint *pb.PeerEndpoint
 var peerEndpointError error
 
 // Cached values of commonly used configuration constants.
-var syncStateSnapshotChannelSize int
-var syncStateDeltasChannelSize int
-var syncBlocksChannelSize int
-var validatorEnabled bool
-
-// Note: There is some kind of circular import issue that prevents us from
-// importing the "core" package into the "peer" package. The
-// 'peer.SecurityEnabled' bit is a duplicate of the 'core.SecurityEnabled'
-// bit.
-var securityEnabled bool
 
 // CacheConfiguration computes and caches commonly-used constants and
 // computed constants as package variables. Routines which were previously
@@ -89,25 +73,16 @@ func CacheConfiguration() (err error) {
 		if err != nil {
 			return nil, err
 		}
-		return &pb.PeerEndpoint{ID: &pb.PeerID{Name: viper.GetString("peer.id")}, Address: peerAddress}, nil
+		return &pb.PeerEndpoint{Id: &pb.PeerID{Name: viper.GetString("peer.id")}, Address: peerAddress}, nil
 	}
 
 	localAddress, localAddressError = getLocalAddress()
-	peerEndpoint, peerEndpointError = getPeerEndpoint()
-
-	syncStateSnapshotChannelSize = viper.GetInt("peer.sync.state.snapshot.channelSize")
-	syncStateDeltasChannelSize = viper.GetInt("peer.sync.state.deltas.channelSize")
-	syncBlocksChannelSize = viper.GetInt("peer.sync.blocks.channelSize")
-	validatorEnabled = viper.GetBool("peer.validator.enabled")
-
-	securityEnabled = true
+	peerEndpoint, _ = getPeerEndpoint()
 
 	configurationCached = true
 
 	if localAddressError != nil {
 		return localAddressError
-	} else if peerEndpointError != nil {
-		return peerEndpointError
 	}
 	return
 }
@@ -137,42 +112,46 @@ func GetPeerEndpoint() (*pb.PeerEndpoint, error) {
 	return peerEndpoint, peerEndpointError
 }
 
-// SyncStateSnapshotChannelSize returns the peer.sync.state.snapshot.channelSize property
-func SyncStateSnapshotChannelSize() int {
-	if !configurationCached {
-		cacheConfiguration()
+// GetServerConfig returns the gRPC server configuration for the peer
+func GetServerConfig() (comm.ServerConfig, error) {
+	secureOptions := &comm.SecureOptions{
+		UseTLS: viper.GetBool("peer.tls.enabled"),
 	}
-	return syncStateSnapshotChannelSize
-}
-
-// SyncStateDeltasChannelSize returns the peer.sync.state.deltas.channelSize property
-func SyncStateDeltasChannelSize() int {
-	if !configurationCached {
-		cacheConfiguration()
+	serverConfig := comm.ServerConfig{SecOpts: secureOptions}
+	if secureOptions.UseTLS {
+		// get the certs from the file system
+		serverKey, err := ioutil.ReadFile(config.GetPath("peer.tls.key.file"))
+		if err != nil {
+			return serverConfig, fmt.Errorf("error loading TLS key (%s)", err)
+		}
+		serverCert, err := ioutil.ReadFile(config.GetPath("peer.tls.cert.file"))
+		if err != nil {
+			return serverConfig, fmt.Errorf("error loading TLS certificate (%s)", err)
+		}
+		secureOptions.ServerCertificate = serverCert
+		secureOptions.ServerKey = serverKey
+		secureOptions.RequireClientCert = viper.GetBool("peer.tls.clientAuthRequired")
+		if secureOptions.RequireClientCert {
+			var clientRoots [][]byte
+			for _, file := range viper.GetStringSlice("peer.tls.clientRootCAs.files") {
+				clientRoot, err := ioutil.ReadFile(
+					config.TranslatePath(filepath.Dir(viper.ConfigFileUsed()), file))
+				if err != nil {
+					return serverConfig,
+						fmt.Errorf("error loading client root CAs (%s)", err)
+				}
+				clientRoots = append(clientRoots, clientRoot)
+			}
+			secureOptions.ClientRootCAs = clientRoots
+		}
+		// check for root cert
+		if config.GetPath("peer.tls.rootcert.file") != "" {
+			rootCert, err := ioutil.ReadFile(config.GetPath("peer.tls.rootcert.file"))
+			if err != nil {
+				return serverConfig, fmt.Errorf("error loading TLS root certificate (%s)", err)
+			}
+			secureOptions.ServerRootCAs = [][]byte{rootCert}
+		}
 	}
-	return syncStateDeltasChannelSize
-}
-
-// SyncBlocksChannelSize returns the peer.sync.blocks.channelSize property
-func SyncBlocksChannelSize() int {
-	if !configurationCached {
-		cacheConfiguration()
-	}
-	return syncBlocksChannelSize
-}
-
-// ValidatorEnabled returns the peer.validator.enabled property
-func ValidatorEnabled() bool {
-	if !configurationCached {
-		cacheConfiguration()
-	}
-	return validatorEnabled
-}
-
-// SecurityEnabled returns the securityEnabled property from cached configuration
-func SecurityEnabled() bool {
-	if !configurationCached {
-		cacheConfiguration()
-	}
-	return securityEnabled
+	return serverConfig, nil
 }

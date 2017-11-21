@@ -1,17 +1,7 @@
 /*
-Copyright IBM Corp. 2016 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-		 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package comm_test
@@ -21,6 +11,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -34,6 +25,7 @@ import (
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/transport"
 
 	"github.com/hyperledger/fabric/core/comm"
 	testpb "github.com/hyperledger/fabric/core/comm/testdata/grpc"
@@ -122,9 +114,10 @@ func invokeEmptyCall(address string, dialOptions []grpc.DialOption) (*testpb.Emp
 
 	//add DialOptions
 	dialOptions = append(dialOptions, grpc.WithBlock())
-	dialOptions = append(dialOptions, grpc.WithTimeout(timeout))
+	ctx := context.Background()
+	ctx, _ = context.WithTimeout(ctx, timeout)
 	//create GRPC client conn
-	clientConn, err := grpc.Dial(address, dialOptions...)
+	clientConn, err := grpc.DialContext(ctx, address, dialOptions...)
 	if err != nil {
 		return nil, err
 	}
@@ -133,12 +126,12 @@ func invokeEmptyCall(address string, dialOptions []grpc.DialOption) (*testpb.Emp
 	//create GRPC client
 	client := testpb.NewTestServiceClient(clientConn)
 
-	ctx := context.Background()
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	callCtx := context.Background()
+	callCtx, cancel := context.WithTimeout(callCtx, timeout)
 	defer cancel()
 
 	//invoke service
-	empty, err := client.EmptyCall(ctx, new(testpb.Empty))
+	empty, err := client.EmptyCall(callCtx, new(testpb.Empty))
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +164,7 @@ var (
 
 type testServer struct {
 	address string
-	config  comm.SecureServerConfig
+	config  comm.ServerConfig
 }
 
 type serverCert struct {
@@ -202,12 +195,14 @@ func (org *testOrg) testServers(port int, clientRootCAs [][]byte) []testServer {
 	for i, serverCert := range org.serverCerts {
 		testServer := testServer{
 			fmt.Sprintf("localhost:%d", port+i),
-			comm.SecureServerConfig{
-				UseTLS:            true,
-				ServerCertificate: serverCert.certPEM,
-				ServerKey:         serverCert.keyPEM,
-				RequireClientCert: true,
-				ClientRootCAs:     clientRootCAs,
+			comm.ServerConfig{
+				SecOpts: &comm.SecureOptions{
+					UseTLS:            true,
+					ServerCertificate: serverCert.certPEM,
+					ServerKey:         serverCert.keyPEM,
+					RequireClientCert: true,
+					ClientRootCAs:     clientRootCAs,
+				},
 			},
 		}
 		testServers = append(testServers, testServer)
@@ -346,7 +341,8 @@ func TestNewGRPCServerInvalidParameters(t *testing.T) {
 
 	t.Parallel()
 	//missing address
-	_, err := comm.NewGRPCServer("", comm.SecureServerConfig{UseTLS: false})
+	_, err := comm.NewGRPCServer("", comm.ServerConfig{
+		SecOpts: &comm.SecureOptions{UseTLS: false}})
 	//check for error
 	msg := "Missing address parameter"
 	assert.EqualError(t, err, msg)
@@ -355,21 +351,21 @@ func TestNewGRPCServerInvalidParameters(t *testing.T) {
 	}
 
 	//missing port
-	_, err = comm.NewGRPCServer("abcdef", comm.SecureServerConfig{UseTLS: false})
+	_, err = comm.NewGRPCServer("abcdef", comm.ServerConfig{
+		SecOpts: &comm.SecureOptions{UseTLS: false}})
 	//check for error
-	msg = "listen tcp: missing port in address abcdef"
-	assert.EqualError(t, err, msg)
-	if err != nil {
-		t.Log(err.Error())
-	}
+	assert.Error(t, err, "Expected error with missing port")
+	msg = "missing port in address"
+	assert.Contains(t, err.Error(), msg)
 
 	//bad port
-	_, err = comm.NewGRPCServer("localhost:1BBB", comm.SecureServerConfig{UseTLS: false})
-	//check for error
-	msgs := [2]string{"listen tcp: lookup tcp/1BBB: nodename nor servname provided, or not known",
-		"listen tcp: unknown port tcp/1BBB"} //different error on MacOS and in Docker
+	_, err = comm.NewGRPCServer("localhost:1BBB", comm.ServerConfig{
+		SecOpts: &comm.SecureOptions{UseTLS: false}})
+	//check for possible errors based on platform and Go release
+	msgs := [3]string{"listen tcp: lookup tcp/1BBB: nodename nor servname provided, or not known",
+		"listen tcp: unknown port tcp/1BBB", "listen tcp: address tcp/1BBB: unknown port"}
 
-	if assert.Error(t, err, "%s or %s expected", msgs[0], msgs[1]) {
+	if assert.Error(t, err, fmt.Sprintf("[%s], [%s] or [%s] expected", msgs[0], msgs[1], msgs[2])) {
 		assert.Contains(t, msgs, err.Error())
 	}
 	if err != nil {
@@ -378,20 +374,22 @@ func TestNewGRPCServerInvalidParameters(t *testing.T) {
 
 	//bad hostname
 	_, err = comm.NewGRPCServer("hostdoesnotexist.localdomain:9050",
-		comm.SecureServerConfig{UseTLS: false})
+		comm.ServerConfig{SecOpts: &comm.SecureOptions{UseTLS: false}})
 	/*
 		We cannot check for a specific error message due to the fact that some
 		systems will automatically resolve unknown host names to a "search"
 		address so we just check to make sure that an error was returned
 	*/
-	assert.Error(t, err, "%s error expected", msg)
+	assert.Error(t, err, fmt.Sprintf("%s error expected", msg))
 	if err != nil {
 		t.Log(err.Error())
 	}
 
 	//address in use
-	_, err = comm.NewGRPCServer(":9040", comm.SecureServerConfig{UseTLS: false})
-	_, err = comm.NewGRPCServer(":9040", comm.SecureServerConfig{UseTLS: false})
+	_, err = comm.NewGRPCServer(":9040", comm.ServerConfig{
+		SecOpts: &comm.SecureOptions{UseTLS: false}})
+	_, err = comm.NewGRPCServer(":9040", comm.ServerConfig{
+		SecOpts: &comm.SecureOptions{UseTLS: false}})
 	//check for error
 	msg = "listen tcp :9040: bind: address already in use"
 	assert.EqualError(t, err, msg)
@@ -401,9 +399,12 @@ func TestNewGRPCServerInvalidParameters(t *testing.T) {
 
 	//missing serverCertificate
 	_, err = comm.NewGRPCServer(":9041",
-		comm.SecureServerConfig{UseTLS: true, ServerCertificate: []byte{}})
+		comm.ServerConfig{
+			SecOpts: &comm.SecureOptions{
+				UseTLS:            true,
+				ServerCertificate: []byte{}}})
 	//check for error
-	msg = "secureConfig must contain both ServerKey and " +
+	msg = "serverConfig.SecOpts must contain both ServerKey and " +
 		"ServerCertificate when UseTLS is true"
 	assert.EqualError(t, err, msg)
 	if err != nil {
@@ -412,7 +413,10 @@ func TestNewGRPCServerInvalidParameters(t *testing.T) {
 
 	//missing serverKey
 	_, err = comm.NewGRPCServer(":9042",
-		comm.SecureServerConfig{UseTLS: true, ServerKey: []byte{}})
+		comm.ServerConfig{
+			SecOpts: &comm.SecureOptions{
+				UseTLS:            true,
+				ServerCertificate: []byte{}}})
 	//check for error
 	assert.EqualError(t, err, msg)
 	if err != nil {
@@ -421,10 +425,11 @@ func TestNewGRPCServerInvalidParameters(t *testing.T) {
 
 	//bad serverKey
 	_, err = comm.NewGRPCServer(":9043",
-		comm.SecureServerConfig{
-			UseTLS:            true,
-			ServerCertificate: []byte(selfSignedCertPEM),
-			ServerKey:         []byte{}})
+		comm.ServerConfig{
+			SecOpts: &comm.SecureOptions{
+				UseTLS:            true,
+				ServerCertificate: []byte(selfSignedCertPEM),
+				ServerKey:         []byte{}}})
 
 	//check for error
 	msg = "tls: failed to find any PEM data in key input"
@@ -435,10 +440,11 @@ func TestNewGRPCServerInvalidParameters(t *testing.T) {
 
 	//bad serverCertificate
 	_, err = comm.NewGRPCServer(":9044",
-		comm.SecureServerConfig{
-			UseTLS:            true,
-			ServerCertificate: []byte{},
-			ServerKey:         []byte(selfSignedKeyPEM)})
+		comm.ServerConfig{
+			SecOpts: &comm.SecureOptions{
+				UseTLS:            true,
+				ServerCertificate: []byte{},
+				ServerKey:         []byte(selfSignedKeyPEM)}})
 	//check for error
 	msg = "tls: failed to find any PEM data in certificate input"
 	assert.EqualError(t, err, msg)
@@ -446,28 +452,13 @@ func TestNewGRPCServerInvalidParameters(t *testing.T) {
 		t.Log(err.Error())
 	}
 
-	//bad clientRootCAs
-	_, err = comm.NewGRPCServer(":9045",
-		comm.SecureServerConfig{
-			UseTLS:            true,
-			ServerCertificate: []byte(selfSignedCertPEM),
-			ServerKey:         []byte(selfSignedKeyPEM),
-			RequireClientCert: true,
-			ClientRootCAs:     [][]byte{[]byte(pemNoCertificateHeader)}})
-	//check for error
-	msg = "Failed to append client root certificate(s): " +
-		"No client root certificates found"
-	assert.EqualError(t, err, msg)
-	if err != nil {
-		t.Log(err.Error())
-	}
-
 	srv, err := comm.NewGRPCServer(":9046",
-		comm.SecureServerConfig{
-			UseTLS:            true,
-			ServerCertificate: []byte(selfSignedCertPEM),
-			ServerKey:         []byte(selfSignedKeyPEM),
-			RequireClientCert: true})
+		comm.ServerConfig{
+			SecOpts: &comm.SecureOptions{
+				UseTLS:            true,
+				ServerCertificate: []byte(selfSignedCertPEM),
+				ServerKey:         []byte(selfSignedKeyPEM),
+				RequireClientCert: true}})
 	badRootCAs := [][]byte{[]byte(badPEM)}
 	err = srv.SetClientRootCAs(badRootCAs)
 	//check for error
@@ -484,7 +475,7 @@ func TestNewGRPCServer(t *testing.T) {
 	t.Parallel()
 	testAddress := "localhost:9053"
 	srv, err := comm.NewGRPCServer(testAddress,
-		comm.SecureServerConfig{UseTLS: false})
+		comm.ServerConfig{SecOpts: &comm.SecureOptions{UseTLS: false}})
 	//check for error
 	if err != nil {
 		t.Fatalf("Failed to return new GRPC server: %v", err)
@@ -496,8 +487,10 @@ func TestNewGRPCServer(t *testing.T) {
 	assert.Equal(t, srv.Address(), addr.String())
 	assert.Equal(t, srv.Listener().Addr().String(), addr.String())
 
-	//TlSEnabled should be false
+	//TLSEnabled should be false
 	assert.Equal(t, srv.TLSEnabled(), false)
+	//MutualTLSRequired should be false
+	assert.Equal(t, srv.MutualTLSRequired(), false)
 
 	//register the GRPC test server
 	testpb.RegisterTestServiceServer(srv.Server(), &testServiceServer{})
@@ -537,7 +530,7 @@ func TestNewGRPCServerFromListener(t *testing.T) {
 	}
 
 	srv, err := comm.NewGRPCServerFromListener(lis,
-		comm.SecureServerConfig{UseTLS: false})
+		comm.ServerConfig{SecOpts: &comm.SecureOptions{UseTLS: false}})
 	//check for error
 	if err != nil {
 		t.Fatalf("Failed to return new GRPC server: %v", err)
@@ -549,8 +542,10 @@ func TestNewGRPCServerFromListener(t *testing.T) {
 	assert.Equal(t, srv.Address(), addr.String())
 	assert.Equal(t, srv.Listener().Addr().String(), addr.String())
 
-	//TlSEnabled should be false
+	//TLSEnabled should be false
 	assert.Equal(t, srv.TLSEnabled(), false)
+	//MutualTLSRequired should be false
+	assert.Equal(t, srv.MutualTLSRequired(), false)
 
 	//register the GRPC test server
 	testpb.RegisterTestServiceServer(srv.Server(), &testServiceServer{})
@@ -581,11 +576,11 @@ func TestNewSecureGRPCServer(t *testing.T) {
 
 	t.Parallel()
 	testAddress := "localhost:9055"
-	srv, err := comm.NewGRPCServer(testAddress, comm.SecureServerConfig{
-		UseTLS:            true,
-		ServerCertificate: []byte(selfSignedCertPEM),
-		ServerKey:         []byte(selfSignedKeyPEM),
-	})
+	srv, err := comm.NewGRPCServer(testAddress, comm.ServerConfig{
+		SecOpts: &comm.SecureOptions{
+			UseTLS:            true,
+			ServerCertificate: []byte(selfSignedCertPEM),
+			ServerKey:         []byte(selfSignedKeyPEM)}})
 	//check for error
 	if err != nil {
 		t.Fatalf("Failed to return new GRPC server: %v", err)
@@ -601,8 +596,10 @@ func TestNewSecureGRPCServer(t *testing.T) {
 	cert, _ := tls.X509KeyPair([]byte(selfSignedCertPEM), []byte(selfSignedKeyPEM))
 	assert.Equal(t, srv.ServerCertificate(), cert)
 
-	//TlSEnabled should be true
+	//TLSEnabled should be true
 	assert.Equal(t, srv.TLSEnabled(), true)
+	//MutualTLSRequired should be false
+	assert.Equal(t, srv.MutualTLSRequired(), false)
 
 	//register the GRPC test server
 	testpb.RegisterTestServiceServer(srv.Server(), &testServiceServer{})
@@ -637,6 +634,20 @@ func TestNewSecureGRPCServer(t *testing.T) {
 	} else {
 		t.Log("GRPC client successfully invoked the EmptyCall service: " + testAddress)
 	}
+
+	// ensure that TLS 1.2 in required / enforced
+	for _, tlsVersion := range []uint16{tls.VersionSSL30, tls.VersionTLS10, tls.VersionTLS11} {
+		_, err = invokeEmptyCall(testAddress,
+			[]grpc.DialOption{grpc.WithTransportCredentials(
+				credentials.NewTLS(&tls.Config{
+					RootCAs:    certPool,
+					MinVersion: tlsVersion,
+					MaxVersion: tlsVersion,
+				}))})
+		t.Logf("TLSVersion [%d] failed with [%s]", tlsVersion, err)
+		assert.Error(t, err, "Should not have been able to connect with TLS version < 1.2")
+		assert.Contains(t, err.Error(), "protocol version not supported")
+	}
 }
 
 func TestNewSecureGRPCServerFromListener(t *testing.T) {
@@ -650,11 +661,11 @@ func TestNewSecureGRPCServerFromListener(t *testing.T) {
 		t.Fatalf("Failed to create listener: %v", err)
 	}
 
-	srv, err := comm.NewGRPCServerFromListener(lis, comm.SecureServerConfig{
-		UseTLS:            true,
-		ServerCertificate: []byte(selfSignedCertPEM),
-		ServerKey:         []byte(selfSignedKeyPEM),
-	})
+	srv, err := comm.NewGRPCServerFromListener(lis, comm.ServerConfig{
+		SecOpts: &comm.SecureOptions{
+			UseTLS:            true,
+			ServerCertificate: []byte(selfSignedCertPEM),
+			ServerKey:         []byte(selfSignedKeyPEM)}})
 	//check for error
 	if err != nil {
 		t.Fatalf("Failed to return new GRPC server: %v", err)
@@ -670,8 +681,10 @@ func TestNewSecureGRPCServerFromListener(t *testing.T) {
 	cert, _ := tls.X509KeyPair([]byte(selfSignedCertPEM), []byte(selfSignedKeyPEM))
 	assert.Equal(t, srv.ServerCertificate(), cert)
 
-	//TlSEnabled should be true
+	//TLSEnabled should be true
 	assert.Equal(t, srv.TLSEnabled(), true)
+	//MutualTLSRequired should be false
+	assert.Equal(t, srv.MutualTLSRequired(), false)
 
 	//register the GRPC test server
 	testpb.RegisterTestServiceServer(srv.Server(), &testServiceServer{})
@@ -730,11 +743,11 @@ func TestWithSignedRootCertificates(t *testing.T) {
 		t.Fatalf("Failed to create listener: %v", err)
 	}
 
-	srv, err := comm.NewGRPCServerFromListener(lis, comm.SecureServerConfig{
-		UseTLS:            true,
-		ServerCertificate: certPEMBlock,
-		ServerKey:         keyPEMBlock,
-	})
+	srv, err := comm.NewGRPCServerFromListener(lis, comm.ServerConfig{
+		SecOpts: &comm.SecureOptions{
+			UseTLS:            true,
+			ServerCertificate: certPEMBlock,
+			ServerKey:         keyPEMBlock}})
 	//check for error
 	if err != nil {
 		t.Fatalf("Failed to return new GRPC server: %v", err)
@@ -765,10 +778,8 @@ func TestWithSignedRootCertificates(t *testing.T) {
 	//invoke the EmptyCall service
 	_, err = invokeEmptyCall(testAddress, dialOptions)
 
-	//client should not be able to connect
-	//for now we can only test that we get a timeout error
-	assert.EqualError(t, err, grpc.ErrClientConnTimeout.Error())
-	t.Logf("assert.EqualError: %s", err.Error())
+	//client should be able to connect with Go 1.9
+	assert.NoError(t, err, "Expected client to connect with server cert only")
 
 	//now use the CA certificate
 	certPoolCA := x509.NewCertPool()
@@ -811,11 +822,11 @@ func TestWithSignedIntermediateCertificates(t *testing.T) {
 		t.Fatalf("Failed to create listener: %v", err)
 	}
 
-	srv, err := comm.NewGRPCServerFromListener(lis, comm.SecureServerConfig{
-		UseTLS:            true,
-		ServerCertificate: certPEMBlock,
-		ServerKey:         keyPEMBlock,
-	})
+	srv, err := comm.NewGRPCServerFromListener(lis, comm.ServerConfig{
+		SecOpts: &comm.SecureOptions{
+			UseTLS:            true,
+			ServerCertificate: certPEMBlock,
+			ServerKey:         keyPEMBlock}})
 	//check for error
 	if err != nil {
 		t.Fatalf("Failed to return new GRPC server: %v", err)
@@ -846,10 +857,8 @@ func TestWithSignedIntermediateCertificates(t *testing.T) {
 	//invoke the EmptyCall service
 	_, err = invokeEmptyCall(testAddress, dialOptions)
 
-	//client should not be able to connect
-	//for now we can only test that we get a timeout error
-	assert.EqualError(t, err, grpc.ErrClientConnTimeout.Error())
-	t.Logf("assert.EqualError: %s", err.Error())
+	//client should be able to connect with Go 1.9
+	assert.NoError(t, err, "Expected client to connect with server cert only")
 
 	//now use the CA certificate
 
@@ -890,6 +899,9 @@ func runMutualAuth(t *testing.T, servers []testServer, trustedClients, unTrusted
 		if err != nil {
 			return err
 		}
+
+		//MutualTLSRequired should be true
+		assert.Equal(t, srv.MutualTLSRequired(), true)
 
 		//register the GRPC test server and start the GRPCServer
 		testpb.RegisterTestServiceServer(srv.Server(), &testServiceServer{})
@@ -987,6 +999,8 @@ func TestMutualAuth(t *testing.T) {
 
 func TestAppendRemoveWithInvalidBytes(t *testing.T) {
 
+	// TODO: revisit when msp serialization without PEM type is resolved
+	t.Skip()
 	t.Parallel()
 
 	noPEMData := [][]byte{[]byte("badcert1"), []byte("badCert2")}
@@ -1354,4 +1368,60 @@ func TestSetClientRootCAs(t *testing.T) {
 		}
 	}
 
+}
+
+func TestKeepaliveNoClientResponse(t *testing.T) {
+	t.Parallel()
+	// set up GRPCServer instance
+	kap := &comm.KeepaliveOptions{
+		ServerInterval: time.Duration(2) * time.Second,
+		ServerTimeout:  time.Duration(1) * time.Second,
+	}
+	testAddress := "localhost:9400"
+	srv, err := comm.NewGRPCServer(testAddress, comm.ServerConfig{KaOpts: kap})
+	assert.NoError(t, err, "Unexpected error starting GRPCServer")
+	go srv.Start()
+	defer srv.Stop()
+
+	// test connection close if client does not response to ping
+	// net client will not response to keepalive
+	client, err := net.Dial("tcp", testAddress)
+	assert.NoError(t, err, "Unexpected error dialing GRPCServer")
+	defer client.Close()
+	// sleep past keepalive timeout
+	time.Sleep(4 * time.Second)
+	data := make([]byte, 24)
+	for {
+		_, err = client.Read(data)
+		if err == nil {
+			continue
+		}
+		assert.EqualError(t, err, io.EOF.Error(), "Expected io.EOF")
+		break
+	}
+}
+
+func TestKeepaliveClientResponse(t *testing.T) {
+	t.Parallel()
+	// set up GRPCServer instance
+	kap := &comm.KeepaliveOptions{
+		ServerInterval: time.Duration(2) * time.Second,
+		ServerTimeout:  time.Duration(1) * time.Second,
+	}
+	testAddress := "localhost:9401"
+	srv, err := comm.NewGRPCServer(testAddress, comm.ServerConfig{KaOpts: kap})
+	assert.NoError(t, err, "Unexpected error starting GRPCServer")
+	go srv.Start()
+	defer srv.Stop()
+
+	// test that connection does not close with response to ping
+	clientTransport, err := transport.NewClientTransport(context.Background(),
+		transport.TargetInfo{Addr: testAddress}, transport.ConnectOptions{})
+	assert.NoError(t, err, "Unexpected error creating client transport")
+	defer clientTransport.Close()
+	// sleep past keepalive timeout
+	time.Sleep(4 * time.Second)
+	// try to create a stream
+	_, err = clientTransport.NewStream(context.Background(), &transport.CallHdr{})
+	assert.NoError(t, err, "Unexpected error creating stream")
 }

@@ -1,17 +1,6 @@
 /*
-Copyright IBM Corp. 2016 All Rights Reserved.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-		 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+Copyright IBM Corp. All Rights Reserved.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package stateleveldb
@@ -19,17 +8,16 @@ package stateleveldb
 import (
 	"bytes"
 	"errors"
-	"fmt"
 
+	"github.com/hyperledger/fabric/common/flogging"
+	"github.com/hyperledger/fabric/common/ledger/util/leveldbhelper"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/statedb"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/version"
 	"github.com/hyperledger/fabric/core/ledger/ledgerconfig"
-	"github.com/hyperledger/fabric/core/ledger/util/leveldbhelper"
-	logging "github.com/op/go-logging"
 	"github.com/syndtr/goleveldb/leveldb/iterator"
 )
 
-var logger = logging.MustGetLogger("stateleveldb")
+var logger = flogging.MustGetLogger("stateleveldb")
 
 var compositeKeySep = []byte{0x00}
 var lastKeyIndicator = byte(0x01)
@@ -80,6 +68,16 @@ func (vdb *versionedDB) Close() {
 	// do nothing because shared db is used
 }
 
+// ValidateKey implements method in VersionedDB interface
+func (vdb *versionedDB) ValidateKey(key string) error {
+	return nil
+}
+
+// BytesKeySuppoted implements method in VersionedDB interface
+func (vdb *versionedDB) BytesKeySuppoted() bool {
+	return true
+}
+
 // GetState implements method in VersionedDB interface
 func (vdb *versionedDB) GetState(namespace string, key string) (*statedb.VersionedValue, error) {
 	logger.Debugf("GetState(). ns=%s, key=%s", namespace, key)
@@ -93,6 +91,18 @@ func (vdb *versionedDB) GetState(namespace string, key string) (*statedb.Version
 	}
 	val, ver := statedb.DecodeValue(dbVal)
 	return &statedb.VersionedValue{Value: val, Version: ver}, nil
+}
+
+// GetVersion implements method in VersionedDB interface
+func (vdb *versionedDB) GetVersion(namespace string, key string) (*version.Height, error) {
+	versionedValue, err := vdb.GetState(namespace, key)
+	if err != nil {
+		return nil, err
+	}
+	if versionedValue == nil {
+		return nil, nil
+	}
+	return versionedValue.Version, nil
 }
 
 // GetStateMultipleKeys implements method in VersionedDB interface
@@ -122,7 +132,7 @@ func (vdb *versionedDB) GetStateRangeScanIterator(namespace string, startKey str
 }
 
 // ExecuteQuery implements method in VersionedDB interface
-func (vdb *versionedDB) ExecuteQuery(query string) (statedb.ResultsIterator, error) {
+func (vdb *versionedDB) ExecuteQuery(namespace, query string) (statedb.ResultsIterator, error) {
 	return nil, errors.New("ExecuteQuery not supported for leveldb")
 }
 
@@ -134,14 +144,8 @@ func (vdb *versionedDB) ApplyUpdates(batch *statedb.UpdateBatch, height *version
 		updates := batch.GetUpdates(ns)
 		for k, vv := range updates {
 			compositeKey := constructCompositeKey(ns, k)
-			// trace the first 200 characters of versioned value only, in case it is huge
-			if logger.IsEnabledFor(logging.DEBUG) {
-				versionedValueDump := fmt.Sprintf("%#v", vv)
-				if len(versionedValueDump) > 200 {
-					versionedValueDump = versionedValueDump[0:200] + "..."
-				}
-				logger.Debugf("Applying key=%#v, versionedValue=%s", compositeKey, versionedValueDump)
-			}
+			logger.Debugf("Channel [%s]: Applying key(string)=[%s] key(bytes)=[%#v]", vdb.dbName, string(compositeKey), compositeKey)
+
 			if vv.Value == nil {
 				dbBatch.Delete(compositeKey)
 			} else {
@@ -150,7 +154,8 @@ func (vdb *versionedDB) ApplyUpdates(batch *statedb.UpdateBatch, height *version
 		}
 	}
 	dbBatch.Put(savePointKey, height.ToBytes())
-	if err := vdb.db.WriteBatch(dbBatch, false); err != nil {
+	// Setting snyc to true as a precaution, false may be an ok optimization after further testing.
+	if err := vdb.db.WriteBatch(dbBatch, true); err != nil {
 		return err
 	}
 	return nil

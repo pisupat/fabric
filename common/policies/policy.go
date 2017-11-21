@@ -1,31 +1,56 @@
 /*
-Copyright IBM Corp. 2016 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-                 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package policies
 
 import (
 	"fmt"
+	"strings"
 
+	"github.com/hyperledger/fabric/common/flogging"
 	cb "github.com/hyperledger/fabric/protos/common"
 
 	"github.com/golang/protobuf/proto"
 	logging "github.com/op/go-logging"
+	"github.com/pkg/errors"
 )
 
-var logger = logging.MustGetLogger("common/policies")
+const (
+	// Path separator is used to separate policy names in paths
+	PathSeparator = "/"
+
+	// ChannelPrefix is used in the path of standard channel policy managers
+	ChannelPrefix = "Channel"
+
+	// ApplicationPrefix is used in the path of standard application policy paths
+	ApplicationPrefix = "Application"
+
+	// OrdererPrefix is used in the path of standard orderer policy paths
+	OrdererPrefix = "Orderer"
+
+	// ChannelReaders is the label for the channel's readers policy (encompassing both orderer and application readers)
+	ChannelReaders = PathSeparator + ChannelPrefix + PathSeparator + "Readers"
+
+	// ChannelWriters is the label for the channel's writers policy (encompassing both orderer and application writers)
+	ChannelWriters = PathSeparator + ChannelPrefix + PathSeparator + "Writers"
+
+	// ChannelApplicationReaders is the label for the channel's application readers policy
+	ChannelApplicationReaders = PathSeparator + ChannelPrefix + PathSeparator + ApplicationPrefix + PathSeparator + "Readers"
+
+	// ChannelApplicationWriters is the label for the channel's application writers policy
+	ChannelApplicationWriters = PathSeparator + ChannelPrefix + PathSeparator + ApplicationPrefix + PathSeparator + "Writers"
+
+	// ChannelApplicationAdmins is the label for the channel's application admin policy
+	ChannelApplicationAdmins = PathSeparator + ChannelPrefix + PathSeparator + ApplicationPrefix + PathSeparator + "Admins"
+
+	// BlockValidation is the label for the policy which should validate the block signatures for the channel
+	BlockValidation = PathSeparator + ChannelPrefix + PathSeparator + OrdererPrefix + PathSeparator + "BlockValidation"
+)
+
+var logger = flogging.MustGetLogger("policies")
 
 // Policy is used to determine if a signature is valid
 type Policy interface {
@@ -33,103 +58,175 @@ type Policy interface {
 	Evaluate(signatureSet []*cb.SignedData) error
 }
 
-// Manager is intended to be the primary accessor of ManagerImpl
-// It is intended to discourage use of the other exported ManagerImpl methods
-// which are used for updating policy by the ConfigManager
+// Manager is a read only subset of the policy ManagerImpl
 type Manager interface {
 	// GetPolicy returns a policy and true if it was the policy requested, or false if it is the default policy
 	GetPolicy(id string) (Policy, bool)
+
+	// Manager returns the sub-policy manager for a given path and whether it exists
+	Manager(path []string) (Manager, bool)
 }
 
 // Provider provides the backing implementation of a policy
 type Provider interface {
 	// NewPolicy creates a new policy based on the policy bytes
-	NewPolicy(data []byte) (Policy, error)
+	NewPolicy(data []byte) (Policy, proto.Message, error)
+}
+
+// ChannelPolicyManagerGetter is a support interface
+// to get access to the policy manager of a given channel
+type ChannelPolicyManagerGetter interface {
+	// Returns the policy manager associated to the passed channel
+	// and true if it was the manager requested, or false if it is the default manager
+	Manager(channelID string) (Manager, bool)
 }
 
 // ManagerImpl is an implementation of Manager and configtx.ConfigHandler
 // In general, it should only be referenced as an Impl for the configtx.ConfigManager
 type ManagerImpl struct {
-	providers       map[int32]Provider
-	policies        map[string]Policy
-	pendingPolicies map[string]Policy
+	path     string // The group level path
+	policies map[string]Policy
+	managers map[string]*ManagerImpl
 }
 
 // NewManagerImpl creates a new ManagerImpl with the given CryptoHelper
-func NewManagerImpl(providers map[int32]Provider) *ManagerImpl {
-	return &ManagerImpl{
-		providers: providers,
-		policies:  make(map[string]Policy),
+func NewManagerImpl(path string, providers map[int32]Provider, root *cb.ConfigGroup) (*ManagerImpl, error) {
+	var err error
+	_, ok := providers[int32(cb.Policy_IMPLICIT_META)]
+	if ok {
+		logger.Panicf("ImplicitMetaPolicy type must be provider by the policy manager")
 	}
+
+	managers := make(map[string]*ManagerImpl)
+
+	for groupName, group := range root.Groups {
+		managers[groupName], err = NewManagerImpl(path+PathSeparator+groupName, providers, group)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	policies := make(map[string]Policy)
+	for policyName, configPolicy := range root.Policies {
+		policy := configPolicy.Policy
+		if policy == nil {
+			return nil, fmt.Errorf("policy %s at path %s was nil", policyName, path)
+		}
+
+		var cPolicy Policy
+
+		if policy.Type == int32(cb.Policy_IMPLICIT_META) {
+			imp, err := newImplicitMetaPolicy(policy.Value, managers)
+			if err != nil {
+				return nil, errors.Wrapf(err, "implicit policy %s at path %s did not compile", policyName, path)
+			}
+			cPolicy = imp
+		} else {
+			provider, ok := providers[int32(policy.Type)]
+			if !ok {
+				return nil, fmt.Errorf("policy %s at path %s has unknown policy type: %v", policyName, path, policy.Type)
+			}
+
+			var err error
+			cPolicy, _, err = provider.NewPolicy(policy.Value)
+			if err != nil {
+				return nil, errors.Wrapf(err, "policy %s at path %s did not compile", policyName, path)
+			}
+		}
+
+		policies[policyName] = cPolicy
+
+		logger.Debugf("Proposed new policy %s for %s", policyName, path)
+	}
+
+	for groupName, manager := range managers {
+		for policyName, policy := range manager.policies {
+			policies[groupName+PathSeparator+policyName] = policy
+		}
+	}
+
+	return &ManagerImpl{
+		path:     path,
+		policies: policies,
+		managers: managers,
+	}, nil
 }
 
 type rejectPolicy string
 
 func (rp rejectPolicy) Evaluate(signedData []*cb.SignedData) error {
-	return fmt.Errorf("No such policy type: %s", rp)
+	return fmt.Errorf("No such policy: '%s'", rp)
+}
+
+// Manager returns the sub-policy manager for a given path and whether it exists
+func (pm *ManagerImpl) Manager(path []string) (Manager, bool) {
+	logger.Debugf("Manager %s looking up path %v", pm.path, path)
+	for manager := range pm.managers {
+		logger.Debugf("Manager %s has managers %s", pm.path, manager)
+	}
+	if len(path) == 0 {
+		return pm, true
+	}
+
+	m, ok := pm.managers[path[0]]
+	if !ok {
+		return nil, false
+	}
+
+	return m.Manager(path[1:])
+}
+
+type policyLogger struct {
+	policy     Policy
+	policyName string
+}
+
+func (pl *policyLogger) Evaluate(signatureSet []*cb.SignedData) error {
+	if logger.IsEnabledFor(logging.DEBUG) {
+		logger.Debugf("== Evaluating %T Policy %s ==", pl.policy, pl.policyName)
+		defer logger.Debugf("== Done Evaluating %T Policy %s", pl.policy, pl.policyName)
+	}
+
+	err := pl.policy.Evaluate(signatureSet)
+	if err != nil {
+		logger.Debugf("Signature set did not satisfy policy %s", pl.policyName)
+	} else {
+		logger.Debugf("Signature set satisfies policy %s", pl.policyName)
+	}
+	return err
 }
 
 // GetPolicy returns a policy and true if it was the policy requested, or false if it is the default reject policy
 func (pm *ManagerImpl) GetPolicy(id string) (Policy, bool) {
-	policy, ok := pm.policies[id]
-	if !ok {
-		if logger.IsEnabledFor(logging.DEBUG) {
-			logger.Debugf("Returning dummy reject all policy because %s could not be found", id)
-		}
+	if id == "" {
+		logger.Errorf("Returning dummy reject all policy because no policy ID supplied")
 		return rejectPolicy(id), false
 	}
-	if logger.IsEnabledFor(logging.DEBUG) {
-		logger.Debugf("Returning policy %s for evaluation", id)
-	}
-	return policy, true
-}
+	var relpath string
 
-// BeginConfig is used to start a new configuration proposal
-func (pm *ManagerImpl) BeginConfig() {
-	if pm.pendingPolicies != nil {
-		logger.Panicf("Programming error, cannot call begin in the middle of a proposal")
-	}
-	pm.pendingPolicies = make(map[string]Policy)
-}
-
-// RollbackConfig is used to abandon a new configuration proposal
-func (pm *ManagerImpl) RollbackConfig() {
-	pm.pendingPolicies = nil
-}
-
-// CommitConfig is used to commit a new configuration proposal
-func (pm *ManagerImpl) CommitConfig() {
-	if pm.pendingPolicies == nil {
-		logger.Panicf("Programming error, cannot call commit without an existing proposal")
-	}
-	pm.policies = pm.pendingPolicies
-	pm.pendingPolicies = nil
-}
-
-// ProposeConfig is used to add new configuration to the configuration proposal
-func (pm *ManagerImpl) ProposeConfig(configItem *cb.ConfigurationItem) error {
-	if configItem.Type != cb.ConfigurationItem_Policy {
-		return fmt.Errorf("Expected type of ConfigurationItem_Policy, got %v", configItem.Type)
+	if strings.HasPrefix(id, PathSeparator) {
+		if !strings.HasPrefix(id, PathSeparator+pm.path) {
+			if logger.IsEnabledFor(logging.DEBUG) {
+				logger.Debugf("Requested absolute policy %s from %s, returning rejectAll", id, pm.path)
+			}
+			return rejectPolicy(id), false
+		}
+		// strip off the leading slash, the path, and the trailing slash
+		relpath = id[1+len(pm.path)+1:]
+	} else {
+		relpath = id
 	}
 
-	policy := &cb.Policy{}
-	err := proto.Unmarshal(configItem.Value, policy)
-	if err != nil {
-		return err
-	}
-
-	provider, ok := pm.providers[int32(policy.Type)]
+	policy, ok := pm.policies[relpath]
 	if !ok {
-		return fmt.Errorf("Unknown policy type: %v", policy.Type)
+		if logger.IsEnabledFor(logging.DEBUG) {
+			logger.Debugf("Returning dummy reject all policy because %s could not be found in %s/%s", id, pm.path, relpath)
+		}
+		return rejectPolicy(relpath), false
 	}
 
-	cPolicy, err := provider.NewPolicy(policy.Policy)
-	if err != nil {
-		return err
-	}
-
-	pm.pendingPolicies[configItem.Key] = cPolicy
-
-	logger.Debugf("Proposed new policy %s", configItem.Key)
-	return nil
+	return &policyLogger{
+		policy:     policy,
+		policyName: PathSeparator + pm.path + PathSeparator + relpath,
+	}, true
 }

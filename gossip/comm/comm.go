@@ -1,26 +1,19 @@
 /*
-Copyright IBM Corp. 2016 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-                 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package comm
 
 import (
+	"encoding/json"
 	"fmt"
+	"time"
 
+	"github.com/hyperledger/fabric/gossip/api"
 	"github.com/hyperledger/fabric/gossip/common"
-	"github.com/hyperledger/fabric/gossip/proto"
+	proto "github.com/hyperledger/fabric/protos/gossip"
 )
 
 // Comm is an object that enables to communicate with other peers
@@ -31,14 +24,22 @@ type Comm interface {
 	GetPKIid() common.PKIidType
 
 	// Send sends a message to remote peers
-	Send(msg *proto.GossipMessage, peers ...*RemotePeer)
+	Send(msg *proto.SignedGossipMessage, peers ...*RemotePeer)
 
-	// Probe probes a remote node and returns nil if its responsive
+	// SendWithAck sends a message to remote peers, waiting for acknowledgement from minAck of them, or until a certain timeout expires
+	SendWithAck(msg *proto.SignedGossipMessage, timeout time.Duration, minAck int, peers ...*RemotePeer) AggregatedSendResult
+
+	// Probe probes a remote node and returns nil if its responsive,
+	// and an error if it's not.
 	Probe(peer *RemotePeer) error
+
+	// Handshake authenticates a remote peer and returns
+	// (its identity, nil) on success and (nil, error)
+	Handshake(peer *RemotePeer) (api.PeerIdentityType, error)
 
 	// Accept returns a dedicated read-only channel for messages sent by other nodes that match a certain predicate.
 	// Each message from the channel can be used to send a reply back to the sender
-	Accept(common.MessageAcceptor) <-chan ReceivedMessage
+	Accept(common.MessageAcceptor) <-chan proto.ReceivedMessage
 
 	// PresumedDead returns a read-only channel for node endpoints that are suspected to be offline
 	PresumedDead() <-chan common.PKIidType
@@ -48,9 +49,6 @@ type Comm interface {
 
 	// Stop stops the module
 	Stop()
-
-	// BlackListPKIid prohibits the module communicating with the given PKIid
-	BlackListPKIid(PKIid common.PKIidType)
 }
 
 // RemotePeer defines a peer's endpoint and its PKIid
@@ -59,24 +57,64 @@ type RemotePeer struct {
 	PKIID    common.PKIidType
 }
 
+// SendResult defines a result of a send to a remote peer
+type SendResult struct {
+	error
+	RemotePeer
+}
+
+// Error returns the error of the SendResult, or an empty string
+// if an error hasn't occurred
+func (sr SendResult) Error() string {
+	if sr.error != nil {
+		return sr.error.Error()
+	}
+	return ""
+}
+
+// AggregatedSendResult represents a slice of SendResults
+type AggregatedSendResult []SendResult
+
+// AckCount returns the number of successful acknowledgements
+func (ar AggregatedSendResult) AckCount() int {
+	c := 0
+	for _, ack := range ar {
+		if ack.error == nil {
+			c++
+		}
+	}
+	return c
+}
+
+// NackCount returns the number of unsuccessful acknowledgements
+func (ar AggregatedSendResult) NackCount() int {
+	return len(ar) - ar.AckCount()
+}
+
+// String returns a JSONed string representation
+// of the AggregatedSendResult
+func (ar AggregatedSendResult) String() string {
+	errMap := map[string]int{}
+	for _, ack := range ar {
+		if ack.error == nil {
+			continue
+		}
+		errMap[ack.Error()]++
+	}
+
+	ackCount := ar.AckCount()
+	output := map[string]interface{}{}
+	if ackCount > 0 {
+		output["successes"] = ackCount
+	}
+	if ackCount < len(ar) {
+		output["failures"] = errMap
+	}
+	b, _ := json.Marshal(output)
+	return string(b)
+}
+
 // String converts a RemotePeer to a string
 func (p *RemotePeer) String() string {
 	return fmt.Sprintf("%s, PKIid:%v", p.Endpoint, p.PKIID)
-}
-
-// ReceivedMessage is a GossipMessage wrapper that
-// enables the user to send a message to the origin from which
-// the ReceivedMessage was sent from.
-// It also allows to know the identity of the sender
-type ReceivedMessage interface {
-
-	// Respond sends a GossipMessage to the origin from which this ReceivedMessage was sent from
-	Respond(msg *proto.GossipMessage)
-
-	// GetGossipMessage returns the underlying GossipMessage
-	GetGossipMessage() *proto.GossipMessage
-
-	// GetPKIID returns the PKI-ID of the remote peer
-	// that sent the message
-	GetPKIID() common.PKIidType
 }
